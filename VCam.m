@@ -2377,9 +2377,9 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 #import <math.h>
 #import <string.h>
 
-// 底层 AudioUnit 拦截已永久关闭：在快手上两次导致闪退（2026-11-21）
-// 保留代码供以后研究，但不再启用
-static const BOOL kEnableAudioUnitHook = NO;
+// 底层 AudioUnit 拦截：代码可用，但默认不生效，
+// 只有面板上的「底层实验」开关打开才启用（默认关闭，稳定优先）
+static const BOOL kEnableAudioUnitHook = YES;
 
 // —— PCM 交换缓冲：网络线程写，音频线程读，纯 C 数据，不做任何 Objective-C 操作 ——
 
@@ -2648,13 +2648,8 @@ static OSStatus VCamAudioUnitUninitialize(AudioUnit unit)
 
 static void VCamInstallAudioUnitHook(void)
 {
-    if (!kEnableAudioUnitHook) {
-        VCamTrace(@"AudioUnitRender 拦截已禁用");
-        return;
-    }
-
     // 危险开关：只有用户主动打开才启用，避免每次启动都冒崩溃风险
-    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"]) {
+    if (!kEnableAudioUnitHook || ![[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"]) {
         VCamTrace(@"底层实验开关未打开，跳过 AudioUnit 拦截");
         return;
     }
