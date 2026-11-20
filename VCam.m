@@ -45,6 +45,10 @@ static volatile int gPCMFrames = 0;
 static volatile double gPCMReadPos = 0.0;
 static volatile int gInjectEnabled = 0;
 
+// 实时电平（0~1），供面板波形显示
+static volatile float gLevelPCM = 0.0f;
+static volatile float gLevelMic = 0.0f;
+
 // ======================= 崩溃取证日志 =======================
 // 每行都落盘并 flush：App 崩溃后重启仍能读到最后一步，用来定位死在哪
 
@@ -1699,6 +1703,15 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
         memcpy(gPCM, pcm.bytes, frames * 4);
         gPCMReadPos = 0.0;
         gPCMFrames = (int)frames;
+
+        // 计算峰值电平（每 8 个采样取一个，够用且省 CPU）
+        const int16_t *s = (const int16_t *)pcm.bytes;
+        int peak = 0;
+        for (NSUInteger i = 0; i < frames * 2; i += 8) {
+            int v = s[i] < 0 ? -s[i] : s[i];
+            if (v > peak) peak = v;
+        }
+        gLevelPCM = peak / 32768.0f;
     }
 
     if (![self isEnabled]) return;
@@ -1839,6 +1852,12 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UILabel *_statusText;
     UILabel *_footer;
     UILabel *_rotationLabel;
+    UIView *_pcmTrack;
+    UIView *_pcmBar;
+    UIView *_micTrack;
+    UIView *_micBar;
+    float _pcmDisp;
+    float _micDisp;
     UITextField *_hostField;
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
@@ -1889,6 +1908,12 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [self buildBubble];
     [self buildCard];
 
+    _meterTimer = [NSTimer scheduledTimerWithTimeInterval:0.08
+                                                   target:self
+                                                 selector:@selector(updateMeters)
+                                                 userInfo:nil
+                                                  repeats:YES];
+
     _timer = [NSTimer scheduledTimerWithTimeInterval:1.0
                                               target:self
                                             selector:@selector(refreshStatus)
@@ -1936,7 +1961,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 456;
+    CGFloat w = 236, h = 512;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -2070,12 +2095,33 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_auSwitch addTarget:self action:@selector(auHookChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_auSwitch];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 392, w - 32, 18) size:11 bold:NO];
+    // 实时电平：电脑音频 / 麦克风
+    [_card addSubview:[self makeLabel:@"🔊" frame:CGRectMake(16, 390, 24, 20) size:14 bold:NO]];
+    _pcmTrack = [[UIView alloc] initWithFrame:CGRectMake(44, 394, 176, 12)];
+    _pcmTrack.backgroundColor = [UIColor colorWithWhite:0 alpha:0.08];
+    _pcmTrack.layer.cornerRadius = 6;
+    _pcmTrack.clipsToBounds = YES;
+    [_card addSubview:_pcmTrack];
+    _pcmBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 12)];
+    _pcmBar.backgroundColor = VCamAccent();
+    [_pcmTrack addSubview:_pcmBar];
+
+    [_card addSubview:[self makeLabel:@"🎤" frame:CGRectMake(16, 414, 24, 20) size:14 bold:NO]];
+    _micTrack = [[UIView alloc] initWithFrame:CGRectMake(44, 418, 176, 12)];
+    _micTrack.backgroundColor = [UIColor colorWithWhite:0 alpha:0.08];
+    _micTrack.layer.cornerRadius = 6;
+    _micTrack.clipsToBounds = YES;
+    [_card addSubview:_micTrack];
+    _micBar = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 0, 12)];
+    _micBar.backgroundColor = [UIColor colorWithRed:0.45 green:0.62 blue:0.42 alpha:1.0];
+    [_micTrack addSubview:_micBar];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 446, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 416, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 470, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -2196,6 +2242,31 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 {
     UIViewController *root = _window.rootViewController;
     [root dismissViewControllerAnimated:YES completion:nil];
+}
+
+// 电平条动画：上升快、下降慢，像真实音频表
+- (void)updateMeters
+{
+    if (!_pcmBar || !_micBar) return;
+
+    float pcm = gLevelPCM;
+    float mic = gLevelMic;
+
+    _pcmDisp = pcm > _pcmDisp ? pcm : _pcmDisp * 0.82f;
+    _micDisp = mic > _micDisp ? mic : _micDisp * 0.82f;
+
+    CGFloat maxW = _pcmTrack.bounds.size.width;
+    CGFloat pcmW = maxW * MIN(1.0, sqrtf(_pcmDisp) * 1.35f);
+    CGFloat micW = maxW * MIN(1.0, sqrtf(_micDisp) * 1.35f);
+
+    _pcmBar.frame = CGRectMake(0, 0, pcmW, 12);
+    _micBar.frame = CGRectMake(0, 0, micW, 12);
+
+    // 底层开关没开时，麦克风电平读不到
+    BOOL hookOn = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"];
+    _micBar.backgroundColor = hookOn
+        ? [UIColor colorWithRed:0.45 green:0.62 blue:0.42 alpha:1.0]
+        : [UIColor colorWithWhite:0.6 alpha:0.5];
 }
 
 - (void)audioChanged:(UISwitch *)s
@@ -2527,6 +2598,31 @@ static OSStatus VCamAudioUnitRender(AudioUnit unit, UInt32 flags, const AudioTim
 
     VCamUnitInfo *info = VCamInfoForUnit(unit, 0);
     if (!info || !info->isInput) return st;
+
+    // 覆盖之前先测一下真实麦克风电平（供面板显示）
+    {
+        float peak = 0.0f;
+        for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
+            AudioBuffer *buf = &ioData->mBuffers[b];
+            if (!buf->mData) continue;
+            if (info->isFloat) {
+                const float *f = (const float *)buf->mData;
+                UInt32 n = buf->mDataByteSize / 4;
+                for (UInt32 i = 0; i < n; i += 8) {
+                    float v = f[i] < 0 ? -f[i] : f[i];
+                    if (v > peak) peak = v;
+                }
+            } else if (info->bits == 16) {
+                const int16_t *s = (const int16_t *)buf->mData;
+                UInt32 n = buf->mDataByteSize / 2;
+                for (UInt32 i = 0; i < n; i += 8) {
+                    int v = s[i] < 0 ? -s[i] : s[i];
+                    if (v > peak) peak = v / 32768.0f;
+                }
+            }
+        }
+        gLevelMic = peak;
+    }
 
     VCamFillFromPCM(ioData, frames, info);
     gRenderFills += 1;
