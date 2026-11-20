@@ -680,11 +680,14 @@ static NSString *VCamAudioReport(void)
 
     [out appendString:@"\n== 四、音频注入候选方法的类型签名 ==\n"];
     NSArray *pushSel = @[
+        @"enableAudioPushStream:",
         @"pushAudioBuffer:andDataLen:sampleRate:channels:andBitsPerSample:timestamp:",
         @"pushExternalAudioFrame:DataSize:FormatType:SampleRate:ChannelNumber:PTS:",
         @"pushExternalSpecifiedAudioFrame:DataSize:FormatType:SampleRate:ChannelNumber:PTS:",
-        @"pushExternalEncodeAudioFrame:",
-        @"pushScreenAudioFrame:",
+        @"pullMicAudio:size:sampleRate:timeStamp:mNumberChannels:numberOfFrames:processedData:earMonitorData:",
+        @"setInputStreamMute:",
+        @"setInputStreamVolume:",
+        @"setAudioSourceType:",
         @"startAudioCapture",
         @"stopAudioCapture",
     ];
@@ -740,6 +743,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (BOOL)micMuteEnabled;
 - (void)setMicMuteEnabled:(BOOL)enabled;
 - (void)applyMicMute;
+- (void)enablePushStreamIfNeeded;
 - (NSUInteger)pushedChunks;
 @end
 
@@ -748,6 +752,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
     int _fd;
     unsigned long long _samples;
     NSUInteger _chunks;
+    BOOL _pushStreamEnabled;
 }
 
 + (instancetype)shared
@@ -784,6 +789,17 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"vcam_mic_mute"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     [self applyMicMute];
+}
+
+- (void)enablePushStreamIfNeeded
+{
+    id target = (__bridge id)gLiveAudioCapture;
+    if (!target) return;
+    if (_pushStreamEnabled) return;
+
+    BOOL ok = VCamCallNumber(target, @"enableAudioPushStream:", 1.0);
+    _pushStreamEnabled = ok;
+    NSLog(@"[vcam] enableAudioPushStream -> %@", ok ? @"成功" : @"失败/无此方法");
 }
 
 - (void)applyMicMute
@@ -874,6 +890,9 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
     id target = (__bridge id)gLiveAudioCapture;
     if (!target) return;
 
+    // 必须先打开外部推流通道，否则 push 的帧会被丢弃
+    [self enablePushStreamIfNeeded];
+
     SEL sel = NSSelectorFromString(@"pushAudioBuffer:andDataLen:sampleRate:channels:andBitsPerSample:timestamp:");
     if (![target respondsToSelector:sel]) return;
 
@@ -931,7 +950,8 @@ static void VCamInstallAudioHooks(void)
             gLiveAudioCapture = (__bridge void *)obj;
             VCamTrace(@"LiveStreamAudioCapture 开始采集，已记录实例，音频注入就绪");
             ((void (*)(id, SEL))o1)(obj, startSel);
-            // 开播后立刻按当前开关状态静音麦克风
+            // 开播后立刻：打开外部推流 + 按当前开关状态静音麦克风
+            [[VCamAudio shared] enablePushStreamIfNeeded];
             [[VCamAudio shared] applyMicMute];
         });
         class_replaceMethod(cls, startSel, r1, method_getTypeEncoding(m1));
