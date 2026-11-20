@@ -646,6 +646,65 @@ static NSString *VCamDumpSignatures(NSString *className, NSArray *selectorNames)
     return s;
 }
 
+// 全类扫描：不管 App 用什么私有音频框架，只要方法名带这些关键词就抓出来
+static NSString *VCamScanAudioAPIs(void)
+{
+    NSMutableString *out = [NSMutableString string];
+
+    NSArray *keys = @[
+        @"pushExternalAudio", @"pushAudio", @"pushAudioFrame", @"pushMic",
+        @"audioFrame", @"captureAudio", @"startAudioCapture", @"stopAudioCapture",
+        @"setMicVolume", @"setMicMute", @"setAudioMute", @"setCaptureVolume",
+        @"setInputVolume", @"setInputMute", @"sendAudio", @"onMic",
+        @"microphone", @"pullMicAudio", @"processAudio", @"audioDeviceModule",
+        @"enableAudio", @"audioBufferList", @"recordAudio",
+    ];
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return out;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    count = objc_getClassList(classes, count);
+
+    NSMutableArray *hits = [NSMutableArray array];
+    for (int i = 0; i < count && hits.count < 800; i++) {
+        Class cls = classes[i];
+        const char *cn = class_getName(cls);
+        if (!cn) continue;
+        NSString *clsName = [NSString stringWithUTF8String:cn];
+        // 跳过系统框架，减少噪音（系统音频采集由探针负责看）
+        if ([clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"UI"] ||
+            [clsName hasPrefix:@"AV"] || [clsName hasPrefix:@"__"] ||
+            [clsName hasPrefix:@"OS_"] || [clsName hasPrefix:@"Swift"]) {
+            continue;
+        }
+
+        unsigned int mc = 0;
+        Method *methods = class_copyMethodList(cls, &mc);
+        for (unsigned int j = 0; j < mc; j++) {
+            NSString *sel = NSStringFromSelector(method_getName(methods[j]));
+            for (NSString *key in keys) {
+                if ([sel rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    [hits addObject:[NSString stringWithFormat:@"%@\n    -%@", clsName, sel]];
+                    break;
+                }
+            }
+            if (hits.count >= 800) break;
+        }
+        free(methods);
+    }
+    free(classes);
+
+    [hits sortUsingSelector:@selector(compare:)];
+    NSUInteger limit = MIN(hits.count, (NSUInteger)200);
+    [out appendString:@"\n== 五、全类扫描：音频注入/采集候选 ==\n"];
+    for (NSUInteger i = 0; i < limit; i++) {
+        [out appendFormat:@"%@\n", hits[i]];
+    }
+    [out appendFormat:@"\n（命中 %lu 条，列出 %lu 条）\n",
+     (unsigned long)hits.count, (unsigned long)limit];
+    return out;
+}
+
 static NSString *VCamAudioReport(void)
 {
     NSMutableString *out = [NSMutableString string];
@@ -727,6 +786,8 @@ static NSString *VCamAudioReport(void)
     ];
     [out appendString:VCamDumpSignatures(@"LiveStreamAudioCapture", pushSel)];
     [out appendString:VCamDumpSignatures(@"BAudioKitObjcAudioDeviceModule", pushSel)];
+
+    [out appendString:VCamScanAudioAPIs()];
 
     return out;
 }
