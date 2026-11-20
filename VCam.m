@@ -831,6 +831,8 @@ static int VCamCountSymbolHits(const char *symbol);
 static NSString *VCamSymbolScanReport(void)
 {
     NSArray *names = @[
+        // 对照组：这些必然有人用，命中为 0 就说明扫描器有 bug
+        @"objc_msgSend", @"NSLog", @"malloc", @"memcpy", @"dlopen",
         @"AudioUnitRender", @"AudioUnitSetProperty", @"AudioUnitGetProperty",
         @"AudioComponentInstanceNew", @"AudioComponentInstanceNewWithOptions",
         @"AudioQueueNewInput", @"AudioQueueNewInputWithDispatchQueue",
@@ -840,7 +842,8 @@ static NSString *VCamSymbolScanReport(void)
 
     NSMutableString *out = [NSMutableString string];
     [out appendString:@"\n== 十一、音频 C 函数引用扫描 ==\n"];
-    [out appendString:@"（命中=0 表示该 App 二进制里完全没有引用这个函数）\n"];
+    [out appendString:@"（先看对照组：objc_msgSend/NSLog/malloc 命中必须 >0，否则是扫描器问题）\n"];
+    [out appendFormat:@"扫描镜像 %d 个、指针节 %d 个\n", gScanImages, gScanSections];
     for (NSString *name in names) {
         const char *cname = [name UTF8String];
         void *addr = dlsym(RTLD_DEFAULT, cname);
@@ -2428,6 +2431,8 @@ static int gRenderCalls = 0;
 static int gSymbolNameHits = 0;      // 符号表里名字命中的槽位数
 static int gSymbolRealFound = 0;     // dlsym 是否拿到真实地址
 static int gWalkOnly = 0;            // 1=只统计符号命中，不修改
+static int gScanImages = 0;
+static int gScanSections = 0;
 static int gRenderFills = 0;
 
 // 只改「确实指向 symbol 真实地址」的槽位
@@ -2463,6 +2468,7 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
     for (uint32_t i = 0; i < imageCount; i++) {
         const struct mach_header *header = _dyld_get_image_header(i);
         if (!header || header->magic != MH_MAGIC_64) continue;
+        if (gWalkOnly) gScanImages += 1;
 
         const char *imageName = _dyld_get_image_name(i);
         if (imageName && (strncmp(imageName, "/System/", 8) == 0 ||
@@ -2511,6 +2517,7 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                 if (type != S_LAZY_SYMBOL_POINTERS && type != S_NON_LAZY_SYMBOL_POINTERS) continue;
 
                 void **slots = (void **)((uint8_t *)mh + (section->addr - textVmaddr));
+                if (gWalkOnly) gScanSections += 1;
                 uint32_t count = (uint32_t)(section->size / sizeof(void *));
                 if (section->reserved1 + count > dysymCmd->nindirectsyms) continue;  // 间接表越界保护
 
@@ -2551,6 +2558,8 @@ static int VCamCountSymbolHits(const char *symbol)
 {
     gWalkOnly = 1;
     gSymbolNameHits = 0;
+    gScanImages = 0;
+    gScanSections = 0;
     VCamRebindSymbol(symbol, NULL, NULL);
     int hits = gSymbolNameHits;
     gWalkOnly = 0;
