@@ -2398,20 +2398,35 @@ static VCamUnitInfo gUnits[8];
 static OSStatus (*gOrigAudioUnitRender)(AudioUnit, UInt32, const AudioTimeStamp *,
                                         UInt32, UInt32, AudioBufferList *) = NULL;
 static int gRenderCalls = 0;
+static int gSymbolNameHits = 0;      // 符号表里名字命中的槽位数
+static int gSymbolRealFound = 0;     // dlsym 是否拿到真实地址
 static int gRenderFills = 0;
 
 // 只改「确实指向 symbol 真实地址」的槽位
 static int VCamRebindSymbol(const char *symbol, void *replacement, void **original)
 {
-    // 插件加载时机很早，AudioToolbox 可能还没被加载，先主动 dlopen
-    static BOOL audioToolboxLoaded = NO;
-    if (!audioToolboxLoaded) {
-        audioToolboxLoaded = YES;
-        dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_LAZY | RTLD_GLOBAL);
+    // 多策略找符号，并把过程记进日志
+    static void *atHandle = NULL;
+    static int tried = 0;
+    if (!tried) {
+        tried = 1;
+        atHandle = dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox",
+                          RTLD_LAZY | RTLD_GLOBAL);
+        VCamLogLine([NSString stringWithFormat:@"dlopen AudioToolbox 句柄=%p 错误=%s",
+                     atHandle, dlerror() ?: "无"]);
     }
 
     void *real = dlsym(RTLD_DEFAULT, symbol);
+    const char *how = "RTLD_DEFAULT";
+    if (!real && atHandle) { real = dlsym(atHandle, symbol); how = "AudioToolbox 句柄"; }
+    if (!real) { real = dlsym(RTLD_NEXT, symbol); how = "RTLD_NEXT"; }
+    if (!real) {
+        void *mainHandle = dlopen(NULL, RTLD_NOW);
+        if (mainHandle) { real = dlsym(mainHandle, symbol); how = "主程序句柄"; }
+    }
+    VCamLogLine([NSString stringWithFormat:@"解析 %s 用 %s -> %p", symbol, how, real]);
     if (!real) return 0;
+    gSymbolRealFound = 1;
 
     int patched = 0;
     uint32_t imageCount = _dyld_image_count();
@@ -2485,6 +2500,7 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                     const char *name = strtab + strx;
                     if (!name) continue;
                     if (name[0] != '_' || strcmp(name + 1, symbol) != 0) continue;
+                    gSymbolNameHits += 1;
 
                     // 名字匹配即替换：延迟绑定的槽位此时可能还是桩函数，
                     // 原实现统一用 dlsym 拿到的真实地址
@@ -2741,6 +2757,8 @@ static NSString *VCamRuntimeLogReport(void)
     [out appendFormat:@"AudioUnit 拦截开关: %@\n",
      [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"] ? @"开" : @"关"];
     [out appendFormat:@"渲染回调次数: %d，其中替换填充: %d\n", gRenderCalls, gRenderFills];
+    [out appendFormat:@"符号名命中: %d 处，真实地址: %@\n",
+     gSymbolNameHits, gSymbolRealFound ? @"已拿到" : @"未拿到"];
     [out appendString:@"\n--- 最近 40 行日志 ---\n"];
     [out appendString:VCamLogTail(40)];
     return out;
