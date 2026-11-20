@@ -95,7 +95,7 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
 + (instancetype)shared;
 - (void)start;
 - (void)stop;
-- (CMSampleBufferRef)copySampleBuffer CF_RETURNS_RETAINED;
+- (CMSampleBufferRef)copySampleBufferForReference:(CMSampleBufferRef)reference CF_RETURNS_RETAINED;
 @end
 
 @implementation VCamClient
@@ -195,50 +195,40 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
     }
 }
 
-#pragma mark - JPEG → CMSampleBuffer
+#pragma mark - JPEG → CMSampleBuffer（完全对齐原帧的格式与时间戳）
 
-- (CVPixelBufferRef)newPixelBufferFromImage:(CGImageRef)image
+- (CMSampleBufferRef)copySampleBufferForReference:(CMSampleBufferRef)reference CF_RETURNS_RETAINED
 {
-    size_t width = CGImageGetWidth(image);
-    size_t height = CGImageGetHeight(image);
-    if (width == 0 || height == 0) return NULL;
+    if (!reference) return NULL;
 
-    NSDictionary *attrs = @{
-        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
-        (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
-        (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
-    };
-    CVPixelBufferRef pixelBuffer = NULL;
-    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height,
-                                          kCVPixelFormatType_420YpCbCr8BiPlanarFullRange,
-                                          (__bridge CFDictionaryRef)attrs, &pixelBuffer);
-    if (status != kCVReturnSuccess || !pixelBuffer) return NULL;
-
-    CIImage *ciImage = [CIImage imageWithCGImage:image];
-    if (!ciImage) {
-        CVPixelBufferRelease(pixelBuffer);
-        return NULL;
-    }
-    @try {
-        [self.ciContext render:ciImage
-              toCVPixelBuffer:pixelBuffer
-                      bounds:CGRectMake(0, 0, width, height)
-                  colorSpace:CGColorSpaceCreateDeviceRGB()];
-    } @catch (NSException *e) {
-        NSLog(@"[vcam] 转像素缓冲区失败: %@", e.reason);
-        CVPixelBufferRelease(pixelBuffer);
-        return NULL;
-    }
-    return pixelBuffer;
-}
-
-- (CMSampleBufferRef)copySampleBuffer CF_RETURNS_RETAINED
-{
     NSData *jpeg = self.latestJPEG;
     if (!jpeg.length) return NULL;
 
+    // 断流了，回落真实摄像头
     NSTimeInterval age = [NSDate timeIntervalSinceReferenceDate] - self.latestAt;
-    if (age > kStaleSeconds) return NULL;   // 断流了，回落真实摄像头
+    if (age > kStaleSeconds) return NULL;
+
+    // 关键：拿原帧的格式描述，按它的尺寸/像素格式/时间戳来造，下游才不会因为不匹配而崩
+    CMFormatDescriptionRef fmtRef = CMSampleBufferGetFormatDescription(reference);
+    if (!fmtRef) return NULL;
+    CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fmtRef);
+    FourCharCode subtype = CMFormatDescriptionGetMediaSubType(fmtRef);
+    if (dims.width <= 0 || dims.height <= 0) return NULL;
+
+    BOOL supported = (subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
+                      subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
+                      subtype == kCVPixelFormatType_32BGRA);
+    if (!supported) {
+        // 不认识的格式就直接放行原帧，宁可不替换也别崩
+        static BOOL warnedOnce = NO;
+        if (!warnedOnce) {
+            warnedOnce = YES;
+            NSLog(@"[vcam] 不支持的像素格式 %c%c%c%c，回落到真实摄像头",
+                  (char)((subtype >> 24) & 0xff), (char)((subtype >> 16) & 0xff),
+                  (char)((subtype >> 8) & 0xff), (char)(subtype & 0xff));
+        }
+        return NULL;
+    }
 
     CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
     if (!source) return NULL;
@@ -246,28 +236,56 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
     CFRelease(source);
     if (!image) return NULL;
 
-    CVPixelBufferRef pixelBuffer = [self newPixelBufferFromImage:image];
+    CIImage *ciImage = [CIImage imageWithCGImage:image];
     CGImageRelease(image);
-    if (!pixelBuffer) return NULL;
+    if (!ciImage) return NULL;
 
-    CMVideoFormatDescriptionRef formatDesc = NULL;
-    OSStatus st = CMVideoFormatDescriptionCreateForImageBuffer(kCFAllocatorDefault, pixelBuffer, &formatDesc);
-    if (st != noErr || !formatDesc) {
+    // 等比缩放并居中（contain），保证画面完整不裁切
+    CGFloat srcW = ciImage.extent.size.width;
+    CGFloat srcH = ciImage.extent.size.height;
+    if (srcW <= 0 || srcH <= 0) return NULL;
+    CGFloat scale = MIN(dims.width / srcW, dims.height / srcH);
+    CGFloat dx = (dims.width - srcW * scale) / 2.0;
+    CGFloat dy = (dims.height - srcH * scale) / 2.0;
+    CIImage *scaled = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    scaled = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
+
+    NSDictionary *attrs = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+        (id)kCVPixelBufferCGImageCompatibilityKey : @YES,
+        (id)kCVPixelBufferCGBitmapContextCompatibilityKey : @YES,
+    };
+    CVPixelBufferRef pixelBuffer = NULL;
+    CVReturn st = CVPixelBufferCreate(kCFAllocatorDefault, (size_t)dims.width, (size_t)dims.height,
+                                      subtype, (__bridge CFDictionaryRef)attrs, &pixelBuffer);
+    if (st != kCVReturnSuccess || !pixelBuffer) return NULL;
+
+    @try {
+        [self.ciContext render:scaled
+              toCVPixelBuffer:pixelBuffer
+                      bounds:CGRectMake(0, 0, dims.width, dims.height)
+                  colorSpace:CGColorSpaceCreateDeviceRGB()];
+    } @catch (NSException *e) {
+        NSLog(@"[vcam] 渲染失败: %@", e.reason);
         CVPixelBufferRelease(pixelBuffer);
         return NULL;
     }
 
+    // 沿用原帧的时间戳，避免下游因为 PTS 跳变而崩
     CMSampleTimingInfo timing = {
-        .duration = CMTimeMake(1, 30),
-        .presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock()),
+        .duration = CMSampleBufferGetDuration(reference),
+        .presentationTimeStamp = CMSampleBufferGetPresentationTimeStamp(reference),
         .decodeTimeStamp = kCMTimeInvalid,
     };
+    if (CMTIME_IS_INVALID(timing.presentationTimeStamp)) {
+        timing.presentationTimeStamp = CMClockGetTime(CMClockGetHostTimeClock());
+    }
+
     CMSampleBufferRef sampleBuffer = NULL;
-    st = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, formatDesc,
-                                                  &timing, &sampleBuffer);
-    CFRelease(formatDesc);
+    OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, fmtRef,
+                                                              &timing, &sampleBuffer);
     CVPixelBufferRelease(pixelBuffer);
-    if (st != noErr || !sampleBuffer) return NULL;
+    if (status != noErr || !sampleBuffer) return NULL;
     return sampleBuffer;
 }
 
@@ -297,7 +315,7 @@ static void VCamSwizzleDelegate(Class cls)
     IMP replacement = imp_implementationWithBlock(^(id self, AVCaptureOutput *output,
                                                    CMSampleBufferRef sampleBuffer,
                                                    AVCaptureConnection *connection) {
-        CMSampleBufferRef ours = [[VCamClient shared] copySampleBuffer];
+        CMSampleBufferRef ours = [[VCamClient shared] copySampleBufferForReference:sampleBuffer];
         if (ours) {
             ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
                 self, sel, output, ours, connection);
@@ -310,14 +328,6 @@ static void VCamSwizzleDelegate(Class cls)
 
     class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(method));
     NSLog(@"[vcam] 已接管 %@ 的帧回调", NSStringFromClass(cls));
-
-    static BOOL reportedSwizzle = NO;
-    if (!reportedSwizzle) {
-        reportedSwizzle = YES;
-        VCamShowAlert([NSString stringWithFormat:@"已接管 %@ 的采集回调\n\n如果画面还是真实摄像头，说明抖音没走这个回调。",
-                                                 NSStringFromClass(cls)],
-                      YES);
-    }
 }
 
 static void VCamInstallHooks(void)

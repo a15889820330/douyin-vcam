@@ -67,7 +67,15 @@ jobs:
         run: |
           mkdir -p out
           find .theos -name '*.dylib' -print
-          find .theos -name '*.dylib' -exec cp {} out/ \;
+          A=".theos/obj/arm64/DouyinVCam.dylib"
+          B=".theos/obj/arm64e/DouyinVCam.dylib"
+          if [ -f "$A" ] && [ -f "$B" ]; then
+            lipo -create -output out/DouyinVCam.dylib "$A" "$B"
+            lipo -info out/DouyinVCam.dylib
+          else
+            echo "只有单架构，直接拷贝"
+            find .theos -name '*.dylib' -exec cp {} out/ \;
+          fi
           ls -lh out
 
       - name: 上传 dylib

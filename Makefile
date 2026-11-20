@@ -1,6 +1,6 @@
 # 编译成普通动态库（不是越狱 tweak，所以不需要 substrate / ellekit）
 TARGET := iphone:clang:latest:15.0
-ARCHS := arm64
+ARCHS := arm64 arm64e
 DEBUG = 0
 FINALPACKAGE = 1
 
