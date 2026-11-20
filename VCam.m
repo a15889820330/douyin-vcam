@@ -76,15 +76,30 @@ static void VCamShowAlert(NSString *message, BOOL force)
 
 // ======================= 读满指定字节 =======================
 
-static BOOL VCamReadFull(int fd, void *buf, size_t len)
+// 读取完整数据
+// 返回: 1=读满  0=对端关闭  -2=本帧还没数据（超时，可继续等）  负数取反为 errno
+static int VCamReadFull(int fd, void *buf, size_t len)
 {
     size_t got = 0;
     while (got < len) {
         ssize_t n = recv(fd, (char *)buf + got, len - got, 0);
-        if (n <= 0) return NO;
-        got += (size_t)n;
+        if (n > 0) {
+            got += (size_t)n;
+            continue;
+        }
+        if (n == 0) {
+            return got == 0 ? 0 : -(int)ECONNRESET;
+        }
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 超时：还没收到数据就继续等；已经读了一半说明流错位，按错误处理
+            return got == 0 ? -2 : -(int)ETIMEDOUT;
+        }
+        if (errno == EINTR) {
+            continue;
+        }
+        return -(int)errno;
     }
-    return YES;
+    return 1;
 }
 
 // ======================= 帧接收 =======================
@@ -189,12 +204,18 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
                 }
                 while (self.running) {
                     uint32_t lenBE = 0;
-                    if (!VCamReadFull(fd, &lenBE, sizeof(lenBE))) break;
+                    int rr = VCamReadFull(fd, &lenBE, sizeof(lenBE));
+                    if (rr == -2) continue;            // 暂时没数据（正常，OBS 还没推流）
+                    if (rr != 1) {
+                        NSLog(@"[vcam] 视频通道断开 r=%d errno=%d", rr, rr < 0 ? -rr : 0);
+                        self.lastReason = [NSString stringWithFormat:@"视频通道断开（%d）", rr < 0 ? -rr : rr];
+                        break;
+                    }
                     uint32_t len = ntohl(lenBE);
                     if (len == 0 || len > 8 * 1024 * 1024) break;
 
                     NSMutableData *data = [NSMutableData dataWithLength:len];
-                    if (!VCamReadFull(fd, data.mutableBytes, len)) break;
+                    if (VCamReadFull(fd, data.mutableBytes, len) != 1) break;
 
                     self.latestJPEG = data;
                     self.latestAt = [NSDate timeIntervalSinceReferenceDate];
@@ -934,7 +955,12 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
                 _fd = fd;
                 NSLog(@"[vcam] 音频通道已连接 %@:%d", VCamHost(), kAudioPort);
                 while (_running) {
-                    if (!VCamReadFull(fd, buf.mutableBytes, chunkBytes)) break;
+                    int r = VCamReadFull(fd, buf.mutableBytes, chunkBytes);
+                    if (r == -2) continue;             // 还没数据，继续等
+                    if (r != 1) {
+                        NSLog(@"[vcam] 音频通道断开 r=%d errno=%d", r, r < 0 ? -r : 0);
+                        break;
+                    }
                     [self pushAudio:buf];
                 }
                 _fd = -1;
@@ -1180,7 +1206,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 410;
+    CGFloat w = 236, h = 418;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -1299,19 +1325,19 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_card addSubview:_audioSwitch];
 
     // 静音麦克风（内录时用电脑声音顶替麦克风）
-    [_card addSubview:[self makeLabel:@"静音麦克风" frame:CGRectMake(16, 306, 120, 24) size:13.5 bold:YES]];
-    _micMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 302, 52, 32)];
+    [_card addSubview:[self makeLabel:@"静音麦克风" frame:CGRectMake(16, 318, 120, 24) size:13.5 bold:YES]];
+    _micMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 314, 52, 32)];
     _micMuteSwitch.onTintColor = VCamAccent();
     _micMuteSwitch.on = [[VCamAudio shared] micMuteEnabled];
     [_micMuteSwitch addTarget:self action:@selector(micMuteChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_micMuteSwitch];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 342, w - 32, 18) size:11 bold:NO];
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 354, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 366, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 378, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -1487,7 +1513,12 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     BOOL connected = c.latestAt > 0 &&
         ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) < kStaleSeconds;
     _statusDot.textColor = connected ? [UIColor colorWithRed:0.55 green:0.66 blue:0.44 alpha:1.0] : VCamMuted();
-    _statusText.text = connected ? @"已连接电脑" : @"未连接";
+    if (connected) {
+        _statusText.text = @"已连接电脑";
+    } else {
+        NSString *why = c.lastReason;
+        _statusText.text = why.length ? [NSString stringWithFormat:@"未连接 · %@", why] : @"未连接";
+    }
     VCamAudio *audio = [VCamAudio shared];
     _footer.text = [NSString stringWithFormat:@"%lu 帧 · 延迟 %.1fs · 音频 %@",
                     (unsigned long)c.frameCount,
