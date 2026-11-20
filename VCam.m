@@ -2671,13 +2671,18 @@ static void VCamInstallAudioUnitHook(void)
     NSString *marker = [VCamLogPath() stringByDeletingLastPathComponent];
     marker = [marker stringByAppendingPathComponent:@"vcam-au-attempt.flag"];
     NSFileManager *fm = [NSFileManager defaultManager];
-    if ([fm fileExistsAtPath:marker]) {
-        VCamTrace(@"检测到上次底层实验崩溃，已自动跳过并关闭开关");
+    NSString *okMarker = [[VCamLogPath() stringByDeletingLastPathComponent]
+                          stringByAppendingPathComponent:@"vcam-au-ok.flag"];
+    if ([fm fileExistsAtPath:marker] && ![fm fileExistsAtPath:okMarker]) {
+        // 上次「开始安装」后没有走到「安装完成」，才判定为崩溃
+        VCamTrace(@"检测到上次安装阶段崩溃，已自动跳过并关闭开关");
         [fm removeItemAtPath:marker error:NULL];
         [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"vcam_au_hook"];
         [[NSUserDefaults standardUserDefaults] synchronize];
         return;
     }
+    [fm removeItemAtPath:okMarker error:NULL];
+    [fm removeItemAtPath:marker error:NULL];
     [fm createFileAtPath:marker contents:[NSData data] attributes:nil];
     VCamTrace(@"已写入尝试标记，开始安装底层拦截");
 
@@ -2698,6 +2703,7 @@ static void VCamInstallAudioUnitHook(void)
     gOrigAudioUnitUninitialize = (OSStatus (*)(AudioUnit))origUninit;
     VCamTrace(@"A4 AudioUnitUninitialize 重绑定 %d 处", n3);
     VCamTrace(@"A5 底层拦截安装完成");
+    [[NSFileManager defaultManager] createFileAtPath:okMarker contents:[NSData data] attributes:nil];
 
     // 延迟绑定的槽位会在首次调用时被 dyld 覆盖，所以过几秒再补一次
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
@@ -2721,6 +2727,9 @@ static void VCamInstallAudioUnitHook(void)
             [fm2 removeItemAtPath:m error:NULL];
             VCamLogLine(@"底层拦截稳定运行 15 秒，清除尝试标记");
         }
+        NSString *ok = [[VCamLogPath() stringByDeletingLastPathComponent]
+                        stringByAppendingPathComponent:@"vcam-au-ok.flag"];
+        if ([fm2 fileExistsAtPath:ok]) [fm2 removeItemAtPath:ok error:NULL];
     });
 }
 
