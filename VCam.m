@@ -2216,6 +2216,9 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 #import <math.h>
 #import <string.h>
 
+// 底层拦截总开关：默认关闭，稳定优先
+static const BOOL kEnableAudioUnitHook = NO;
+
 static int VCamRebindSymbol(const char *symbol, void *replacement, void **original)
 {
     int patched = 0;
@@ -2424,6 +2427,12 @@ static OSStatus VCamAudioUnitRender(AudioUnit unit, UInt32 flags, const AudioTim
 
 static void VCamInstallAudioUnitHook(void)
 {
+    if (!kEnableAudioUnitHook) {
+        // 默认关闭：底层重绑定风险高（实时线程里查属性/读偏好会死锁或触发 watchdog）
+        VCamTrace(@"AudioUnitRender 拦截已禁用（稳定模式）");
+        return;
+    }
+
     void *orig = NULL;
     int n = VCamRebindSymbol("AudioUnitRender", (void *)VCamAudioUnitRender, &orig);
     gOrigAudioUnitRender = (OSStatus (*)(AudioUnit, UInt32, const AudioTimeStamp *,
