@@ -1866,6 +1866,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UISwitch *_micMuteSwitch;
     UISegmentedControl *_fitSegment;
     NSTimer *_timer;
+    NSTimer *_meterTimer;
     BOOL _expanded;
 }
 
