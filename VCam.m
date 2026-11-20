@@ -763,6 +763,7 @@ static NSString *VCamFindImplementors(void)
 
 static NSString *VCamKuaishouReport(void);
 static NSString *VCamKuaishouDeepReport(void);
+static NSString *VCamKuaishouCaptureReport(void);
 
 static NSString *VCamAudioReport(void)
 {
@@ -850,6 +851,7 @@ static NSString *VCamAudioReport(void)
     [out appendString:VCamFindImplementors()];
     [out appendString:VCamKuaishouReport()];
     [out appendString:VCamKuaishouDeepReport()];
+    [out appendString:VCamKuaishouCaptureReport()];
 
     return out;
 }
@@ -1086,10 +1088,115 @@ static NSString *VCamKuaishouDeepReport(void)
     return out;
 }
 
+// ======================= 快手：麦克风采集会话（KWDAudioCaptureSession） =======================
+
+static void *gKwCapture = NULL;       // 采集会话对象
+static void *gKwCaptureBlock = NULL;  // 快手拿麦克风数据的回调 block
+static NSString *gKwCaptureInfo = nil;
+
+typedef struct {
+    void *isa;
+    int flags;
+    int reserved;
+    void *invoke;
+    void *descriptor;
+} VCamBlockLayout;
+
+typedef struct {
+    unsigned long reserved;
+    unsigned long size;
+    void *copy;
+    void *dispose;
+    const char *signature;
+} VCamBlockDescriptor;
+
+static NSString *VCamDescribeBlock(void *blockPtr)
+{
+    if (!blockPtr) return @"(nil)";
+    VCamBlockLayout *layout = (VCamBlockLayout *)blockPtr;
+    NSMutableString *s = [NSMutableString string];
+    [s appendFormat:@"block flags=%d invoke=%p\n", layout->flags, layout->invoke];
+    if (layout->descriptor) {
+        VCamBlockDescriptor *d = (VCamBlockDescriptor *)layout->descriptor;
+        [s appendFormat:@"block 签名: %s\n", d->signature ? d->signature : "(无)"];
+        [s appendFormat:@"block 大小: %lu\n", d->size];
+    }
+    return s;
+}
+
+// 读取采集会话的采样参数（getter 返回 unsigned long）
+static NSString *VCamDescribeCaptureSession(void)
+{
+    id session = (__bridge id)gKwCapture;
+    if (!session) return @"（还没拿到采集会话）";
+
+    NSMutableString *s = [NSMutableString stringWithFormat:@"类名: %s\n", class_getName(object_getClass(session))];
+    @try {
+        unsigned long rate = ((unsigned long (*)(id, SEL))objc_msgSend)(session, @selector(sampleRate));
+        unsigned long ch = ((unsigned long (*)(id, SEL))objc_msgSend)(session, @selector(channelNum));
+        unsigned long bps = ((unsigned long (*)(id, SEL))objc_msgSend)(session, @selector(bytesPerSample));
+        [s appendFormat:@"sampleRate=%lu channelNum=%lu bytesPerSample=%lu\n", rate, ch, bps];
+    } @catch (NSException *e) {
+        [s appendFormat:@"读取格式异常: %@\n", e.reason];
+    }
+    if (gKwCaptureBlock) {
+        [s appendFormat:@"\n%@", VCamDescribeBlock(gKwCaptureBlock)];
+    }
+    return s;
+}
+
+static NSString *VCamKuaishouCaptureReport(void)
+{
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 九、快手麦克风采集回调 ==\n@"];
+    [out appendString:gKwCaptureInfo ?: @"（还没捕获：进直播画面后再看这里）\n@"];
+    if (!gKwCaptureInfo) {
+        [out appendString:VCamDescribeCaptureSession()];
+        [out appendString:@"\n@"];
+    }
+    return out;
+}
+
+static void VCamHookKuaishouCapture(void)
+{
+    Class cls = objc_getClass("KWDAudioCaptureSession");
+    if (!cls) return;
+
+    SEL sel = @selector(setAudioCaptureBlock:);
+    Method m = class_getInstanceMethod(cls, sel);
+    if (m) {
+        IMP orig = method_getImplementation(m);
+        IMP repl = imp_implementationWithBlock(^(id obj, id block) {
+            gKwCapture = (__bridge void *)obj;
+            gKwCaptureBlock = (__bridge void *)block;
+            if (!gKwCaptureInfo) {
+                gKwCaptureInfo = [VCamDescribeCaptureSession() copy];
+                VCamTrace(@"抓到快手麦克风采集回调（KWDAudioCaptureSession）");
+            }
+            ((void (*)(id, SEL, id))orig)(obj, sel, block);
+        });
+        class_replaceMethod(cls, sel, repl, method_getTypeEncoding(m));
+        VCamTrace(@"已 hook KWDAudioCaptureSession setAudioCaptureBlock:");
+    }
+
+    SEL startSel = @selector(startAudioCapture);
+    Method startM = class_getInstanceMethod(cls, startSel);
+    if (startM) {
+        IMP startOrig = method_getImplementation(startM);
+        IMP startRepl = imp_implementationWithBlock(^(id obj) {
+            gKwCapture = (__bridge void *)obj;
+            VCamTrace(@"快手开始采集麦克风");
+            ((void (*)(id, SEL))startOrig)(obj, startSel);
+        });
+        class_replaceMethod(cls, startSel, startRepl, method_getTypeEncoding(startM));
+    }
+}
+
 // 装上快手侧的探针：只观察，不改变行为
 static void VCamInstallKuaishouHooks(void)
 {
     // 先覆盖「所有实现类」，避免只命中接口代理类
+    VCamHookKuaishouCapture();
     VCamHookAllImplementorsOfInputSpeakerAudioFrame();
     VCamHookAllImplementorsOfMultiTrackMix();
 
