@@ -98,6 +98,8 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
 - (void)start;
 - (void)stop;
 - (CMSampleBufferRef)copySampleBufferForReference:(CMSampleBufferRef)reference CF_RETURNS_RETAINED;
+// 推荐路径：直接把电脑画面写进原帧的像素缓冲区（不新建 CMSampleBuffer，零格式风险）
+- (BOOL)overwriteFrameBuffer:(CVPixelBufferRef)pixelBuffer;
 @end
 
 @implementation VCamClient
@@ -225,7 +227,84 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
     VCamShowAlert(msg, YES);
 }
 
-#pragma mark - JPEG → CMSampleBuffer（完全对齐原帧的格式与时间戳）
+#pragma mark - 原地写入像素（推荐路径）
+
+- (BOOL)overwriteFrameBuffer:(CVPixelBufferRef)pixelBuffer
+{
+    self.lastReason = nil;
+
+    if (!pixelBuffer) {
+        self.lastReason = @"原帧没有像素缓冲";
+        return NO;
+    }
+
+    NSData *jpeg = self.latestJPEG;
+    if (!jpeg.length) {
+        self.lastReason = @"还没收到电脑画面";
+        return NO;
+    }
+
+    NSTimeInterval age = [NSDate timeIntervalSinceReferenceDate] - self.latestAt;
+    if (age > kStaleSeconds) {
+        self.lastReason = @"电脑画面太旧（断流）";
+        return NO;
+    }
+
+    size_t dstW = CVPixelBufferGetWidth(pixelBuffer);
+    size_t dstH = CVPixelBufferGetHeight(pixelBuffer);
+    if (dstW == 0 || dstH == 0) {
+        self.lastReason = @"原帧尺寸为 0";
+        return NO;
+    }
+
+    CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
+    if (!source) {
+        self.lastReason = @"JPEG 读取失败";
+        return NO;
+    }
+    CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
+    CFRelease(source);
+    if (!image) {
+        self.lastReason = @"JPEG 解码失败";
+        return NO;
+    }
+
+    CIImage *ciImage = [CIImage imageWithCGImage:image];
+    CGImageRelease(image);
+    if (!ciImage) {
+        self.lastReason = @"CIImage 创建失败";
+        return NO;
+    }
+
+    // 等比缩放居中（contain）
+    CGFloat srcW = ciImage.extent.size.width;
+    CGFloat srcH = ciImage.extent.size.height;
+    if (srcW <= 0 || srcH <= 0) {
+        self.lastReason = @"电脑画面尺寸异常";
+        return NO;
+    }
+    CGFloat scale = MIN((CGFloat)dstW / srcW, (CGFloat)dstH / srcH);
+    CGFloat dx = ((CGFloat)dstW - srcW * scale) / 2.0;
+    CGFloat dy = ((CGFloat)dstH - srcH * scale) / 2.0;
+    CIImage *scaled = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
+    scaled = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
+
+    // 直接渲染进抖音自己那块缓冲区：格式/尺寸/时间戳都是它原本的，不会不匹配
+    @try {
+        [self.ciContext render:scaled
+              toCVPixelBuffer:pixelBuffer
+                      bounds:CGRectMake(0, 0, dstW, dstH)
+                  colorSpace:NULL];
+    } @catch (NSException *e) {
+        self.lastReason = [NSString stringWithFormat:@"渲染异常：%@", e.reason];
+        return NO;
+    }
+
+    self.lastReason = @"替换成功（原地写入原帧缓冲区）";
+    return YES;
+}
+
+#pragma mark - JPEG → CMSampleBuffer（备选路径，当前未使用）
 
 - (CMSampleBufferRef)copySampleBufferForReference:(CMSampleBufferRef)reference CF_RETURNS_RETAINED
 {
@@ -363,7 +442,8 @@ static void VCamSwizzleDelegate(Class cls)
             VCamReportDiag(@"entry", @"回调已进入", client.latestJPEG, age, st, d);
         }
 
-        CMSampleBufferRef ours = [client copySampleBufferForReference:sampleBuffer];
+        CVPixelBufferRef pixelBuffer = CMSampleBufferGetImageBuffer(sampleBuffer);
+        [client overwriteFrameBuffer:pixelBuffer];
 
         // 诊断 2：第 3 次回调时报告替换结果（成功 / 具体卡在哪一步）
         if (diagCalls == 3) {
@@ -376,14 +456,9 @@ static void VCamSwizzleDelegate(Class cls)
             VCamReportDiag(@"result", reason, client.latestJPEG, age, st, d);
         }
 
-        if (ours) {
-            ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
-                self, sel, output, ours, connection);
-            CFRelease(ours);
-        } else {
-            ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
-                self, sel, output, sampleBuffer, connection);
-        }
+        // 像素已经就地写进原帧缓冲区，直接把原帧交给下游
+        ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
+            self, sel, output, sampleBuffer, connection);
     });
 
     class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(method));
