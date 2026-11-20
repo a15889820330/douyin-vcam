@@ -46,6 +46,13 @@ static volatile int gPCMFrames = 0;
 static volatile double gPCMReadPos = 0.0;
 static volatile int gInjectEnabled = 0;
 
+// 符号扫描计数（供诊断报告使用）
+static int gSymbolNameHits = 0;
+static int gSymbolRealFound = 0;
+static int gWalkOnly = 0;
+static int gScanImages = 0;
+static int gScanSections = 0;
+
 // 实时电平（0~1），供面板波形显示
 static volatile float gLevelPCM = 0.0f;
 static volatile float gLevelMic = 0.0f;
@@ -2428,11 +2435,6 @@ static VCamUnitInfo gUnits[8];
 static OSStatus (*gOrigAudioUnitRender)(AudioUnit, UInt32, const AudioTimeStamp *,
                                         UInt32, UInt32, AudioBufferList *) = NULL;
 static int gRenderCalls = 0;
-static int gSymbolNameHits = 0;      // 符号表里名字命中的槽位数
-static int gSymbolRealFound = 0;     // dlsym 是否拿到真实地址
-static int gWalkOnly = 0;            // 1=只统计符号命中，不修改
-static int gScanImages = 0;
-static int gScanSections = 0;
 static int gRenderFills = 0;
 
 // 只改「确实指向 symbol 真实地址」的槽位
