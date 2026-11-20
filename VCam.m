@@ -17,6 +17,7 @@
 #import <objc/runtime.h>
 #import <objc/message.h>
 #import <string.h>
+#import <dlfcn.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
