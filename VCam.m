@@ -702,6 +702,45 @@ static NSString *VCamAudioReport(void)
 // 抖音直播的音频采集对象（LiveStreamAudioCapture），在 startAudioCapture 时记下来
 static void *gLiveAudioCapture = NULL;
 
+// 麦克风采集器（IESLiveAudioCapturerImp）实例，用它自己的静音接口只掐麦克风
+static void *gAudioCapturer = NULL;
+
+// 调用「数字 + 字符串」两个参数的方法（如 setAudioMute:reason:）
+static BOOL VCamCallNumberString(id target, NSString *selectorName, double number, NSString *text)
+{
+    SEL sel = NSSelectorFromString(selectorName);
+    if (!target || ![target respondsToSelector:sel]) return NO;
+
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 4) return NO;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:target];
+    [inv setSelector:sel];
+
+    const char *t2 = [sig getArgumentTypeAtIndex:2];
+    switch (t2 ? t2[0] : 'B') {
+        case 'B': case 'c': { char c = (number != 0.0) ? 1 : 0; [inv setArgument:&c atIndex:2]; break; }
+        case 'i': case 'l': { int i = (int)number; [inv setArgument:&i atIndex:2]; break; }
+        case 'q': { long long q = (long long)number; [inv setArgument:&q atIndex:2]; break; }
+        case 'f': { float f = (float)number; [inv setArgument:&f atIndex:2]; break; }
+        case 'd': { double d = number; [inv setArgument:&d atIndex:2]; break; }
+        default: return NO;
+    }
+
+    const char *t3 = [sig getArgumentTypeAtIndex:3];
+    if (!t3 || t3[0] != '@') return NO;
+    id s = text ? text : @"vcam";
+    [inv setArgument:&s atIndex:3];
+
+    @try { [inv invoke]; }
+    @catch (NSException *e) {
+        NSLog(@"[vcam] 调用 %@ 异常: %@", selectorName, e.reason);
+        return NO;
+    }
+    return YES;
+}
+
 // 通用调用器：不知道参数是 float/double/int/BOOL，就按方法签名里的实际类型传
 static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 {
@@ -804,15 +843,27 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 
 - (void)applyMicMute
 {
+    BOOL shouldMute = [self isEnabled] && [self micMuteEnabled];
+
+    // 首选：采集器自己的静音——只掐麦克风，不动我们推送的音频
+    id capturer = (__bridge id)gAudioCapturer;
+    if (capturer) {
+        BOOL okCap = VCamCallNumberString(capturer, @"setAudioMute:reason:",
+                                          shouldMute ? 1.0 : 0.0, @"vcam");
+        if (okCap) {
+            NSLog(@"[vcam] 麦克风静音 %@（采集器 setAudioMute，精确静音）", shouldMute ? @"开" : @"关");
+            return;
+        }
+    }
+
+    // 退路：输入流静音（会把推送的音频一起掐掉，只剩静音）
     id target = (__bridge id)gLiveAudioCapture;
     if (!target) {
         NSLog(@"[vcam] 音频对象还没出现，等开播后再静音麦克风");
         return;
     }
 
-    BOOL shouldMute = [self isEnabled] && [self micMuteEnabled];
-
-    // 优先用静音开关，没有就退到音量归零
+    // 退路：静音输入流 / 音量归零（会连推送的音频一起静音）
     BOOL ok = VCamCallNumber(target, @"setInputStreamMute:", shouldMute ? 1.0 : 0.0);
     NSString *how = @"setInputStreamMute:";
     if (!ok) {
@@ -936,6 +987,22 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 
 static void VCamInstallAudioHooks(void)
 {
+    Class capCls = objc_getClass("IESLiveAudioCapturerImp");
+    if (capCls) {
+        SEL capSel = NSSelectorFromString(@"startAudioCaptureWithReason:completion:");
+        Method capMethod = class_getInstanceMethod(capCls, capSel);
+        if (capMethod) {
+            IMP capOrig = method_getImplementation(capMethod);
+            IMP capRepl = imp_implementationWithBlock(^(id obj, id reason, id completion) {
+                gAudioCapturer = (__bridge void *)obj;
+                VCamTrace(@"IESLiveAudioCapturerImp 开始采集，已记录实例（可用精确静音）");
+                ((void (*)(id, SEL, id, id))capOrig)(obj, capSel, reason, completion);
+                [[VCamAudio shared] applyMicMute];
+            });
+            class_replaceMethod(capCls, capSel, capRepl, method_getTypeEncoding(capMethod));
+        }
+    }
+
     Class cls = objc_getClass("LiveStreamAudioCapture");
     if (!cls) {
         NSLog(@"[vcam] 找不到 LiveStreamAudioCapture，音频注入不可用");
