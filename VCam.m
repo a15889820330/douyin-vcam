@@ -442,6 +442,124 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
 
 @end
 
+// ======================= 音频路径诊断 =======================
+
+static NSMutableArray *gAudioTrace;
+static NSTimeInterval gStartTime;
+
+static void VCamTrace(NSString *fmt, ...)
+{
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        gAudioTrace = [NSMutableArray array];
+        gStartTime = [NSDate timeIntervalSinceReferenceDate];
+    });
+    va_list ap;
+    va_start(ap, fmt);
+    NSString *s = [[NSString alloc] initWithFormat:fmt arguments:ap];
+    va_end(ap);
+    NSString *line = [NSString stringWithFormat:@"%6.1fs  %@",
+                      [NSDate timeIntervalSinceReferenceDate] - gStartTime, s];
+    @synchronized (gAudioTrace) {
+        [gAudioTrace addObject:line];
+        if (gAudioTrace.count > 300) [gAudioTrace removeObjectAtIndex:0];
+    }
+    NSLog(@"[vcam-audio] %@", s);
+}
+
+// 被动观察：不改变行为，只记录抖音的音频管线走了哪条路
+static void VCamInstallAudioProbes(void)
+{
+    // 1) AVCaptureAudioDataOutput：如果命中，说明音频和视频一样走标准采集回调
+    Class audioOut = objc_getClass("AVCaptureAudioDataOutput");
+    if (audioOut) {
+        SEL sel = @selector(setSampleBufferDelegate:queue:);
+        Method m = class_getInstanceMethod(audioOut, sel);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP repl = imp_implementationWithBlock(^(id obj, id delegate, dispatch_queue_t q) {
+                VCamTrace(@"AVCaptureAudioDataOutput 设置 delegate → %@", NSStringFromClass([delegate class]));
+                ((void (*)(id, SEL, id, dispatch_queue_t))orig)(obj, sel, delegate, q);
+            });
+            class_replaceMethod(audioOut, sel, repl, method_getTypeEncoding(m));
+        }
+    }
+
+    // 2) AVAudioEngine：如果命中，说明走的是 AVAudioEngine 管线
+    Class engine = objc_getClass("AVAudioEngine");
+    if (engine) {
+        SEL sel = @selector(startAndReturnError:);
+        Method m = class_getInstanceMethod(engine, sel);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP repl = imp_implementationWithBlock(^BOOL(id obj, NSError **err) {
+                VCamTrace(@"AVAudioEngine 启动（可能走 AVAudioEngine 管线）");
+                return ((BOOL (*)(id, SEL, NSError **))orig)(obj, sel, err);
+            });
+            class_replaceMethod(engine, sel, repl, method_getTypeEncoding(m));
+        }
+    }
+
+    // 3) AVAudioSession：看它的 category，判断是录音还是播放
+    Class session = objc_getClass("AVAudioSession");
+    if (session) {
+        SEL sel = @selector(setCategory:mode:options:error:);
+        Method m = class_getInstanceMethod(session, sel);
+        if (m) {
+            IMP orig = method_getImplementation(m);
+            IMP repl = imp_implementationWithBlock(^BOOL(id obj, NSString *cat, NSString *mode,
+                                                         NSUInteger opt, NSError **err) {
+                VCamTrace(@"AVAudioSession category=%@ mode=%@", cat, mode);
+                return ((BOOL (*)(id, SEL, NSString *, NSString *, NSUInteger, NSError **))orig)(
+                    obj, sel, cat, mode, opt, err);
+            });
+            class_replaceMethod(session, sel, repl, method_getTypeEncoding(m));
+        }
+    }
+
+    VCamTrace(@"音频探针已安装");
+}
+
+static NSString *VCamAudioReport(void)
+{
+    NSMutableString *out = [NSMutableString string];
+
+    [out appendString:@"== 一、运行时观察到的音频调用 ==\n"];
+    @synchronized (gAudioTrace) {
+        if (gAudioTrace.count == 0) {
+            [out appendString:@"（一条都没有——请先进入抖音直播/拍摄画面，再回来打开这个面板）\n"];
+        } else {
+            for (NSString *line in gAudioTrace) {
+                [out appendFormat:@"%@\n", line];
+            }
+        }
+    }
+
+    [out appendString:@"\n== 二、类名含 Audio 的类 ==\n"];
+    int count = objc_getClassList(NULL, 0);
+    if (count > 0) {
+        Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+        count = objc_getClassList(classes, count);
+        NSMutableArray *names = [NSMutableArray array];
+        for (int i = 0; i < count; i++) {
+            const char *n = class_getName(classes[i]);
+            if (!n) continue;
+            NSString *name = [NSString stringWithUTF8String:n];
+            if ([name rangeOfString:@"audio" options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                [names addObject:name];
+            }
+        }
+        free(classes);
+        [names sortUsingSelector:@selector(compare:)];
+        for (NSString *n in names) {
+            [out appendFormat:@"%@\n", n];
+        }
+        [out appendFormat:@"\n（共 %lu 个）\n", (unsigned long)names.count];
+    }
+
+    return out;
+}
+
 // ======================= 悬浮控制面板（奶油 + 暖黄） =======================
 
 static UIColor *VCamInk(void)    { return [UIColor colorWithRed:0.18 green:0.17 blue:0.14 alpha:1.0]; }
@@ -568,7 +686,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 260;
+    CGFloat w = 236, h = 300;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -654,6 +772,16 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
+    UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    audioBtn.frame = CGRectMake(16, 260, w - 32, 30);
+    audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
+    audioBtn.layer.cornerRadius = 8;
+    [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
+    [audioBtn setTitleColor:VCamInk() forState:UIControlStateNormal];
+    audioBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [audioBtn addTarget:self action:@selector(showAudioReport) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:audioBtn];
+
     UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
     [title addGestureRecognizer:pan];
     title.userInteractionEnabled = YES;
@@ -713,6 +841,58 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_hostField resignFirstResponder];
     [[VCamClient shared] restart];
     NSLog(@"[vcam] 电脑 IP 改为 %@，正在重连", ip);
+}
+
+- (void)showAudioReport
+{
+    NSString *text = VCamAudioReport();
+    [[UIPasteboard generalPasteboard] setString:text];
+    NSLog(@"[vcam] 音频诊断已复制到剪贴板");
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIViewController *root = self->_window.rootViewController;
+        if (!root) return;
+
+        UIViewController *vc = [UIViewController new];
+        vc.view.backgroundColor = VCamCard();
+
+        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 88, vc.view.bounds.size.width,
+                                                                     vc.view.bounds.size.height - 88)];
+        tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+        tv.text = text;
+        tv.editable = NO;
+        tv.font = [UIFont fontWithName:@"Menlo" size:11] ?: [UIFont systemFontOfSize:11];
+        tv.textColor = VCamInk();
+        tv.backgroundColor = VCamCard();
+        [vc.view addSubview:tv];
+
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, vc.view.bounds.size.width - 100, 24)];
+        title.text = @"音频路径诊断（已复制到剪贴板）";
+        title.font = [UIFont boldSystemFontOfSize:13];
+        title.textColor = VCamInk();
+        title.autoresizingMask = UIViewAutoresizingFlexibleWidth;
+        [vc.view addSubview:title];
+
+        UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
+        close.frame = CGRectMake(vc.view.bounds.size.width - 76, 44, 60, 32);
+        close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
+        close.backgroundColor = VCamAccent();
+        close.layer.cornerRadius = 8;
+        [close setTitle:@"关闭" forState:UIControlStateNormal];
+        [close setTitleColor:VCamInk() forState:UIControlStateNormal];
+        close.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+        [close addTarget:self action:@selector(dismissReport) forControlEvents:UIControlEventTouchUpInside];
+        [vc.view addSubview:close];
+
+        vc.modalPresentationStyle = UIModalPresentationFullScreen;
+        [root presentViewController:vc animated:YES completion:nil];
+    });
+}
+
+- (void)dismissReport
+{
+    UIViewController *root = _window.rootViewController;
+    [root dismissViewControllerAnimated:YES completion:nil];
 }
 
 - (void)refreshStatus
@@ -829,6 +1009,7 @@ static void VCamInit(void)
         gSwizzledClasses = [NSMutableSet set];
         NSLog(@"[vcam] dylib 已加载，目标 %@:%d", VCamHost(), kFramePort);
         VCamInstallHooks();
+        VCamInstallAudioProbes();
 
         // 加载后 2 秒：开始收帧 + 弹出控制面板
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
