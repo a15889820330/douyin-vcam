@@ -27,6 +27,8 @@
 static NSString *const kDefaultHost = @"192.168.1.42";
 // 裸 TCP 帧端口（电脑端 frames.js 里的 clientPort）
 static const int kFramePort = 9003;
+// 裸 TCP 音频端口（电脑端 audio.js 里的 tcpPort）
+static const int kAudioPort = 9004;
 // 断流多久回落到真实摄像头
 static const NSTimeInterval kStaleSeconds = 2.0;
 // 是否显示调试提示框（调好后关掉，只留控制面板）
@@ -692,6 +694,187 @@ static NSString *VCamAudioReport(void)
     return out;
 }
 
+// ======================= 音频注入（把电脑声音推进抖音） =======================
+
+// 抖音直播的音频采集对象（LiveStreamAudioCapture），在 startAudioCapture 时记下来
+static void *gLiveAudioCapture = NULL;
+
+@interface VCamAudio : NSObject
++ (instancetype)shared;
+- (void)start;
+- (void)stop;
+- (BOOL)isEnabled;
+- (void)setEnabled:(BOOL)enabled;
+- (NSUInteger)pushedChunks;
+@end
+
+@implementation VCamAudio {
+    BOOL _running;
+    int _fd;
+    unsigned long long _samples;
+    NSUInteger _chunks;
+}
+
++ (instancetype)shared
+{
+    static VCamAudio *a = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ a = [[VCamAudio alloc] init]; });
+    return a;
+}
+
+- (BOOL)isEnabled
+{
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"vcam_audio"];
+    return v ? [v boolValue] : NO;
+}
+
+- (void)setEnabled:(BOOL)enabled
+{
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"vcam_audio"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSLog(@"[vcam] 声音内录 -> %@", enabled ? @"开" : @"关");
+}
+
+- (NSUInteger)pushedChunks { return _chunks; }
+
+- (void)start
+{
+    if (_running) return;
+    _running = YES;
+    [NSThread detachNewThreadSelector:@selector(readLoop) toTarget:self withObject:nil];
+}
+
+- (void)stop
+{
+    _running = NO;
+    int fd = _fd;
+    if (fd > 0) shutdown(fd, SHUT_RDWR);
+}
+
+- (void)readLoop
+{
+    @autoreleasepool {
+        // 20ms @ 48kHz 立体声 16bit = 3840 字节
+        const size_t chunkBytes = 3840;
+        NSMutableData *buf = [NSMutableData dataWithLength:chunkBytes];
+
+        while (_running) {
+            int fd = socket(AF_INET, SOCK_STREAM, 0);
+            if (fd < 0) {
+                [NSThread sleepForTimeInterval:2.0];
+                continue;
+            }
+            int one = 1;
+            setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+            struct timeval tv = { 5, 0 };
+            setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+            struct sockaddr_in addr;
+            memset(&addr, 0, sizeof(addr));
+            addr.sin_family = AF_INET;
+            addr.sin_port = htons(kAudioPort);
+            addr.sin_addr.s_addr = inet_addr([VCamHost() UTF8String]);
+
+            if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                _fd = fd;
+                NSLog(@"[vcam] 音频通道已连接 %@:%d", VCamHost(), kAudioPort);
+                while (_running) {
+                    if (!VCamReadFull(fd, buf.mutableBytes, chunkBytes)) break;
+                    [self pushAudio:buf];
+                }
+                _fd = -1;
+            }
+
+            close(fd);
+            if (_running) [NSThread sleepForTimeInterval:2.0];
+        }
+    }
+}
+
+- (void)pushAudio:(NSData *)pcm
+{
+    if (![self isEnabled]) return;
+
+    id target = (__bridge id)gLiveAudioCapture;
+    if (!target) return;
+
+    SEL sel = NSSelectorFromString(@"pushAudioBuffer:andDataLen:sampleRate:channels:andBitsPerSample:timestamp:");
+    if (![target respondsToSelector:sel]) return;
+
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 8) return;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:target];
+    [inv setSelector:sel];
+
+    char *bytes = (char *)pcm.bytes;
+    unsigned long len = (unsigned long)pcm.length;
+    int sampleRate = 48000;
+    int channels = 2;
+    int bitsPerSample = 16;
+    long long timestamp = (long long)(_samples * 1000ULL / 48000ULL);
+
+    [inv setArgument:&bytes atIndex:2];
+    [inv setArgument:&len atIndex:3];
+    [inv setArgument:&sampleRate atIndex:4];
+    [inv setArgument:&channels atIndex:5];
+    [inv setArgument:&bitsPerSample atIndex:6];
+    [inv setArgument:&timestamp atIndex:7];
+
+    @try {
+        [inv invoke];
+    } @catch (NSException *e) {
+        NSLog(@"[vcam] 音频注入异常: %@", e.reason);
+        gLiveAudioCapture = NULL;
+        return;
+    }
+
+    _samples += pcm.length / 4;   // 16bit × 2 声道 = 4 字节/采样
+    _chunks += 1;
+    if (_chunks == 1) {
+        NSLog(@"[vcam] 已推送第一块音频 %lu 字节", (unsigned long)pcm.length);
+    }
+}
+
+@end
+
+static void VCamInstallAudioHooks(void)
+{
+    Class cls = objc_getClass("LiveStreamAudioCapture");
+    if (!cls) {
+        NSLog(@"[vcam] 找不到 LiveStreamAudioCapture，音频注入不可用");
+        return;
+    }
+
+    SEL startSel = @selector(startAudioCapture);
+    Method m1 = class_getInstanceMethod(cls, startSel);
+    if (m1) {
+        IMP o1 = method_getImplementation(m1);
+        IMP r1 = imp_implementationWithBlock(^(id obj) {
+            gLiveAudioCapture = (__bridge void *)obj;
+            VCamTrace(@"LiveStreamAudioCapture 开始采集，已记录实例，音频注入就绪");
+            ((void (*)(id, SEL))o1)(obj, startSel);
+        });
+        class_replaceMethod(cls, startSel, r1, method_getTypeEncoding(m1));
+    }
+
+    SEL stopSel = @selector(stopAudioCapture);
+    Method m2 = class_getInstanceMethod(cls, stopSel);
+    if (m2) {
+        IMP o2 = method_getImplementation(m2);
+        IMP r2 = imp_implementationWithBlock(^(id obj) {
+            ((void (*)(id, SEL))o2)(obj, stopSel);
+            if (gLiveAudioCapture == (__bridge void *)obj) gLiveAudioCapture = NULL;
+            VCamTrace(@"LiveStreamAudioCapture 停止采集，清除实例");
+        });
+        class_replaceMethod(cls, stopSel, r2, method_getTypeEncoding(m2));
+    }
+
+    VCamTrace(@"音频注入 hook 已安装");
+}
+
 // ======================= 悬浮控制面板（奶油 + 暖黄） =======================
 
 static UIColor *VCamInk(void)    { return [UIColor colorWithRed:0.18 green:0.17 blue:0.14 alpha:1.0]; }
@@ -727,6 +910,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UITextField *_hostField;
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
+    UISwitch *_audioSwitch;
     UISegmentedControl *_fitSegment;
     NSTimer *_timer;
     BOOL _expanded;
@@ -818,7 +1002,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 300;
+    CGFloat w = 236, h = 336;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -900,12 +1084,20 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [connectBtn addTarget:self action:@selector(connectTapped) forControlEvents:UIControlEventTouchUpInside];
     [_card addSubview:connectBtn];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 236, w - 32, 18) size:11 bold:NO];
+    // 声音内录
+    [_card addSubview:[self makeLabel:@"声音内录" frame:CGRectMake(16, 236, 120, 24) size:13.5 bold:YES]];
+    _audioSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 232, 52, 32)];
+    _audioSwitch.onTintColor = VCamAccent();
+    _audioSwitch.on = [[VCamAudio shared] isEnabled];
+    [_audioSwitch addTarget:self action:@selector(audioChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_audioSwitch];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 272, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 260, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 296, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -1028,6 +1220,11 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [root dismissViewControllerAnimated:YES completion:nil];
 }
 
+- (void)audioChanged:(UISwitch *)s
+{
+    [[VCamAudio shared] setEnabled:s.on];
+}
+
 - (void)refreshStatus
 {
     if (!_statusText) return;
@@ -1036,9 +1233,13 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
         ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) < kStaleSeconds;
     _statusDot.textColor = connected ? [UIColor colorWithRed:0.55 green:0.66 blue:0.44 alpha:1.0] : VCamMuted();
     _statusText.text = connected ? @"已连接电脑" : @"未连接";
-    _footer.text = [NSString stringWithFormat:@"已接收 %lu 帧 · 延迟 %.1fs",
+    VCamAudio *audio = [VCamAudio shared];
+    _footer.text = [NSString stringWithFormat:@"%lu 帧 · 延迟 %.1fs · 音频 %@",
                     (unsigned long)c.frameCount,
-                    c.latestAt ? ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) : 0.0];
+                    c.latestAt ? ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) : 0.0,
+                    audio.isEnabled
+                        ? [NSString stringWithFormat:@"%lu 块", (unsigned long)audio.pushedChunks]
+                        : @"关"];
 }
 
 @end
@@ -1143,11 +1344,13 @@ static void VCamInit(void)
         NSLog(@"[vcam] dylib 已加载，目标 %@:%d", VCamHost(), kFramePort);
         VCamInstallHooks();
         VCamInstallAudioProbes();
+        VCamInstallAudioHooks();
 
         // 加载后 2 秒：开始收帧 + 弹出控制面板
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
             [[VCamClient shared] start];
+            [[VCamAudio shared] start];
             [[VCamOverlay shared] install];
         });
     }
