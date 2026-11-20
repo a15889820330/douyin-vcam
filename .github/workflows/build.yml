@@ -32,6 +32,19 @@ jobs:
           echo "使用 SDK: $SDK"
           cp -R "$RUNNER_TEMP/sdks/$SDK" "$THEOS/sdks/"
 
+      - name: 安装 ldid（Theos 签名必需）
+        run: |
+          brew install ldid || true
+          if command -v ldid >/dev/null 2>&1; then
+            ln -sf "$(command -v ldid)" "$THEOS/bin/ldid"
+          else
+            echo "brew 装不上，改用预编译二进制"
+            curl -L -o "$THEOS/bin/ldid" \
+              https://github.com/theos/ldid/releases/latest/download/ldid_macosx_x86_64
+            chmod +x "$THEOS/bin/ldid"
+          fi
+          "$THEOS/bin/ldid" -v 2>&1 | head -3 || true
+
       - name: 编译
         run: |
           set +e
