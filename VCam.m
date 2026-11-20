@@ -92,6 +92,7 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
 @property (atomic, assign) BOOL running;
 @property (atomic, assign) NSUInteger frameCount;
 @property (atomic, assign) BOOL reportedLoaded;
+@property (atomic, copy) NSString *diagReason;
 + (instancetype)shared;
 - (void)start;
 - (void)stop;
@@ -193,6 +194,30 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
             if (self.running) [NSThread sleepForTimeInterval:2.0];
         }
     }
+}
+
+// ======================= 首帧诊断 =======================
+
+static NSString *VCamFourCC(FourCharCode code)
+{
+    char s[5] = { (char)((code >> 24) & 0xff), (char)((code >> 16) & 0xff),
+                  (char)((code >> 8) & 0xff), (char)(code & 0xff), 0 };
+    return [NSString stringWithUTF8String:s];
+}
+
+static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
+                           FourCharCode subtype, CMVideoDimensions dims)
+{
+    static BOOL shown = NO;
+    if (shown) return;
+    shown = YES;
+
+    NSString *msg = [NSString stringWithFormat:
+        @"首帧诊断\n\n结果：%@\n原帧格式：%@  %dx%d\n有电脑画面：%@（延迟 %.1f 秒）",
+        reason,
+        VCamFourCC(subtype), dims.width, dims.height,
+        jpeg.length ? @"有" : @"没有", age];
+    VCamShowAlert(msg, YES);
 }
 
 #pragma mark - JPEG → CMSampleBuffer（完全对齐原帧的格式与时间戳）
@@ -315,6 +340,19 @@ static void VCamSwizzleDelegate(Class cls)
     IMP replacement = imp_implementationWithBlock(^(id self, AVCaptureOutput *output,
                                                    CMSampleBufferRef sampleBuffer,
                                                    AVCaptureConnection *connection) {
+        // 诊断：确认回调真的进了、原帧是什么像素格式、有没有收到电脑画面
+        static int diagCalls = 0;
+        diagCalls += 1;
+        if (diagCalls == 1) {
+            CMFormatDescriptionRef f = CMSampleBufferGetFormatDescription(sampleBuffer);
+            CMVideoDimensions d = f ? CMVideoFormatDescriptionGetDimensions(f) : (CMVideoDimensions){0, 0};
+            FourCharCode st = f ? CMFormatDescriptionGetMediaSubType(f) : 0;
+            VCamClient *client = [VCamClient shared];
+            NSTimeInterval age = client.latestAt
+                ? ([NSDate timeIntervalSinceReferenceDate] - client.latestAt) : -1;
+            VCamReportDiag(@"回调已进入", client.latestJPEG, age, st, d);
+        }
+
         CMSampleBufferRef ours = [[VCamClient shared] copySampleBufferForReference:sampleBuffer];
         if (ours) {
             ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
