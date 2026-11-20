@@ -699,12 +699,47 @@ static NSString *VCamAudioReport(void)
 // 抖音直播的音频采集对象（LiveStreamAudioCapture），在 startAudioCapture 时记下来
 static void *gLiveAudioCapture = NULL;
 
+// 通用调用器：不知道参数是 float/double/int/BOOL，就按方法签名里的实际类型传
+static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
+{
+    SEL sel = NSSelectorFromString(selectorName);
+    if (!target || ![target respondsToSelector:sel]) return NO;
+
+    NSMethodSignature *sig = [target methodSignatureForSelector:sel];
+    if (!sig || sig.numberOfArguments < 3) return NO;
+
+    NSInvocation *inv = [NSInvocation invocationWithMethodSignature:sig];
+    [inv setTarget:target];
+    [inv setSelector:sel];
+
+    const char *type = [sig getArgumentTypeAtIndex:2];
+    char t = type ? type[0] : 'i';
+    switch (t) {
+        case 'f': { float f = (float)value; [inv setArgument:&f atIndex:2]; break; }
+        case 'd': { double d = value; [inv setArgument:&d atIndex:2]; break; }
+        case 'B': case 'c': { char c = (value != 0.0) ? 1 : 0; [inv setArgument:&c atIndex:2]; break; }
+        case 'i': case 'l': { int i = (int)value; [inv setArgument:&i atIndex:2]; break; }
+        case 'q': { long long q = (long long)value; [inv setArgument:&q atIndex:2]; break; }
+        default: return NO;
+    }
+
+    @try { [inv invoke]; }
+    @catch (NSException *e) {
+        NSLog(@"[vcam] 调用 %@ 异常: %@", selectorName, e.reason);
+        return NO;
+    }
+    return YES;
+}
+
 @interface VCamAudio : NSObject
 + (instancetype)shared;
 - (void)start;
 - (void)stop;
 - (BOOL)isEnabled;
 - (void)setEnabled:(BOOL)enabled;
+- (BOOL)micMuteEnabled;
+- (void)setMicMuteEnabled:(BOOL)enabled;
+- (void)applyMicMute;
 - (NSUInteger)pushedChunks;
 @end
 
@@ -734,6 +769,46 @@ static void *gLiveAudioCapture = NULL;
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"vcam_audio"];
     [[NSUserDefaults standardUserDefaults] synchronize];
     NSLog(@"[vcam] 声音内录 -> %@", enabled ? @"开" : @"关");
+    [self applyMicMute];
+}
+
+// 内录时不要让麦克风把环境声混进来：把输入流静音/音量归零
+- (BOOL)micMuteEnabled
+{
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"vcam_mic_mute"];
+    return v ? [v boolValue] : YES;
+}
+
+- (void)setMicMuteEnabled:(BOOL)enabled
+{
+    [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"vcam_mic_mute"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self applyMicMute];
+}
+
+- (void)applyMicMute
+{
+    id target = (__bridge id)gLiveAudioCapture;
+    if (!target) {
+        NSLog(@"[vcam] 音频对象还没出现，等开播后再静音麦克风");
+        return;
+    }
+
+    BOOL shouldMute = [self isEnabled] && [self micMuteEnabled];
+
+    // 优先用静音开关，没有就退到音量归零
+    BOOL ok = VCamCallNumber(target, @"setInputStreamMute:", shouldMute ? 1.0 : 0.0);
+    NSString *how = @"setInputStreamMute:";
+    if (!ok) {
+        ok = VCamCallNumber(target, @"setInputStreamVolume:", shouldMute ? 0.0 : 1.0);
+        how = @"setInputStreamVolume:";
+    }
+    if (!ok) {
+        ok = VCamCallNumber(target, @"setCaptureVolume:", shouldMute ? 0.0 : 1.0);
+        how = @"setCaptureVolume:";
+    }
+
+    NSLog(@"[vcam] 麦克风静音 %@（%@ %@）", shouldMute ? @"开" : @"关", how, ok ? @"成功" : @"无可用接口");
 }
 
 - (NSUInteger)pushedChunks { return _chunks; }
@@ -856,6 +931,8 @@ static void VCamInstallAudioHooks(void)
             gLiveAudioCapture = (__bridge void *)obj;
             VCamTrace(@"LiveStreamAudioCapture 开始采集，已记录实例，音频注入就绪");
             ((void (*)(id, SEL))o1)(obj, startSel);
+            // 开播后立刻按当前开关状态静音麦克风
+            [[VCamAudio shared] applyMicMute];
         });
         class_replaceMethod(cls, startSel, r1, method_getTypeEncoding(m1));
     }
@@ -911,6 +988,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
     UISwitch *_audioSwitch;
+    UISwitch *_micMuteSwitch;
     UISegmentedControl *_fitSegment;
     NSTimer *_timer;
     BOOL _expanded;
@@ -1002,7 +1080,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 336;
+    CGFloat w = 236, h = 372;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -1092,12 +1170,20 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_audioSwitch addTarget:self action:@selector(audioChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_audioSwitch];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 272, w - 32, 18) size:11 bold:NO];
+    // 静音麦克风（内录时用电脑声音顶替麦克风）
+    [_card addSubview:[self makeLabel:@"静音麦克风" frame:CGRectMake(16, 266, 120, 24) size:13.5 bold:YES]];
+    _micMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 262, 52, 32)];
+    _micMuteSwitch.onTintColor = VCamAccent();
+    _micMuteSwitch.on = [[VCamAudio shared] micMuteEnabled];
+    [_micMuteSwitch addTarget:self action:@selector(micMuteChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_micMuteSwitch];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 302, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 296, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 326, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -1223,6 +1309,11 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 - (void)audioChanged:(UISwitch *)s
 {
     [[VCamAudio shared] setEnabled:s.on];
+}
+
+- (void)micMuteChanged:(UISwitch *)s
+{
+    [[VCamAudio shared] setMicMuteEnabled:s.on];
 }
 
 - (void)refreshStatus
