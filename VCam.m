@@ -2461,6 +2461,7 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
 
                 void **slots = (void **)((uint8_t *)mh + (section->addr - textVmaddr));
                 uint32_t count = (uint32_t)(section->size / sizeof(void *));
+                if (section->reserved1 + count > dysymCmd->nindirectsyms) continue;  // 间接表越界保护
 
                 vm_address_t page = (vm_address_t)slots & ~(vm_page_size - 1);
                 vm_size_t pageSize = section->size + ((vm_address_t)slots - page);
@@ -2471,7 +2472,10 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                 for (uint32_t k = 0; k < count; k++) {
                     uint32_t symIndex = indirect[section->reserved1 + k];
                     if (symIndex == INDIRECT_SYMBOL_LOCAL || symIndex == INDIRECT_SYMBOL_ABS) continue;
-                    const char *name = strtab + symtab[symIndex].n_un.n_strx;
+                    if (symIndex >= symtabCmd->nsyms) continue;              // 越界保护
+                    uint32_t strx = symtab[symIndex].n_un.n_strx;
+                    if (strx == 0 || strx >= symtabCmd->strsize) continue;   // 字符串越界保护
+                    const char *name = strtab + strx;
                     if (!name) continue;
                     if (name[0] != '_' || strcmp(name + 1, symbol) != 0) continue;
 
@@ -2654,6 +2658,20 @@ static void VCamInstallAudioUnitHook(void)
         return;
     }
 
+    // 崩溃自愈：上次尝试没走完就崩溃的话，这次自动跳过并关掉开关
+    NSString *marker = [VCamLogPath() stringByDeletingLastPathComponent];
+    marker = [marker stringByAppendingPathComponent:@"vcam-au-attempt.flag"];
+    NSFileManager *fm = [NSFileManager defaultManager];
+    if ([fm fileExistsAtPath:marker]) {
+        VCamTrace(@"检测到上次底层实验崩溃，已自动跳过并关闭开关");
+        [fm removeItemAtPath:marker error:NULL];
+        [[NSUserDefaults standardUserDefaults] setBool:NO forKey:@"vcam_au_hook"];
+        [[NSUserDefaults standardUserDefaults] synchronize];
+        return;
+    }
+    [fm createFileAtPath:marker contents:[NSData data] attributes:nil];
+    VCamTrace(@"已写入尝试标记，开始安装底层拦截");
+
     VCamTrace(@"A1 准备重绑定 AudioUnitRender");
     void *orig = NULL;
     int n = VCamRebindSymbol("AudioUnitRender", (void *)VCamAudioUnitRender, &orig);
@@ -2671,6 +2689,18 @@ static void VCamInstallAudioUnitHook(void)
     gOrigAudioUnitUninitialize = (OSStatus (*)(AudioUnit))origUninit;
     VCamTrace(@"A4 AudioUnitUninitialize 重绑定 %d 处", n3);
     VCamTrace(@"A5 底层拦截安装完成");
+
+    // 15 秒后仍存活，说明这次没崩，清掉标记
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        NSFileManager *fm2 = [NSFileManager defaultManager];
+        NSString *m = [[VCamLogPath() stringByDeletingLastPathComponent]
+                       stringByAppendingPathComponent:@"vcam-au-attempt.flag"];
+        if ([fm2 fileExistsAtPath:m]) {
+            [fm2 removeItemAtPath:m error:NULL];
+            VCamLogLine(@"底层拦截稳定运行 15 秒，清除尝试标记");
+        }
+    });
 }
 
 // 运行期统计 + 最近日志（用来定位崩溃点）
