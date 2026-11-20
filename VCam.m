@@ -1,4 +1,4 @@
-// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -855,9 +855,10 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
         UIViewController *vc = [UIViewController new];
         vc.view.backgroundColor = VCamCard();
+        CGFloat W = self->_window.bounds.size.width;
+        CGFloat H = self->_window.bounds.size.height;
 
-        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 88, vc.view.bounds.size.width,
-                                                                     vc.view.bounds.size.height - 88)];
+        UITextView *tv = [[UITextView alloc] initWithFrame:CGRectMake(0, 88, W, H - 88)];
         tv.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
         tv.text = text;
         tv.editable = NO;
@@ -866,7 +867,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
         tv.backgroundColor = VCamCard();
         [vc.view addSubview:tv];
 
-        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, vc.view.bounds.size.width - 100, 24)];
+        UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(16, 48, W - 100, 24)];
         title.text = @"音频路径诊断（已复制到剪贴板）";
         title.font = [UIFont boldSystemFontOfSize:13];
         title.textColor = VCamInk();
@@ -874,7 +875,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
         [vc.view addSubview:title];
 
         UIButton *close = [UIButton buttonWithType:UIButtonTypeSystem];
-        close.frame = CGRectMake(vc.view.bounds.size.width - 76, 44, 60, 32);
+        close.frame = CGRectMake(W - 76, 44, 60, 32);
         close.autoresizingMask = UIViewAutoresizingFlexibleLeftMargin;
         close.backgroundColor = VCamAccent();
         close.layer.cornerRadius = 8;
