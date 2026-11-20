@@ -937,9 +937,104 @@ static NSString *VCamKuaishouReport(void)
     return out;
 }
 
+// 把一个 selector 的所有实现类都替换掉（Kotlin/Native 的接口类和实现类都要覆盖）
+static void VCamHookAllImplementorsOfInputSpeakerAudioFrame(void)
+{
+    SEL sel = @selector(inputSpeakerAudioFrame:);
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    count = objc_getClassList(classes, count);
+
+    int hooked = 0;
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (!class_respondsToSelector(cls, sel)) continue;
+        Method m = class_getInstanceMethod(cls, sel);
+        const char *enc = m ? method_getTypeEncoding(m) : NULL;
+        if (!enc || enc[0] != 'i') continue;
+
+        IMP orig = method_getImplementation(m);
+        IMP repl = imp_implementationWithBlock(^int(id obj, id frame) {
+            gKuaishouRtc = (__bridge void *)obj;
+            if (!gKuaishouFrameInfo) {
+                gKuaishouFrameInfo = [VCamDescribeObject(frame) copy];
+                VCamTrace(@"抓到快手音频帧对象（inputSpeakerAudioFrame）");
+            }
+            return ((int (*)(id, SEL, id))orig)(obj, sel, frame);
+        });
+        class_replaceMethod(cls, sel, repl, enc);
+        hooked += 1;
+    }
+    free(classes);
+    VCamTrace(@"inputSpeakerAudioFrame: 共替换 %d 个实现类", hooked);
+}
+
+// 多轨混音入口：返回值有 int 和 void 两种，分别处理
+static void VCamHookAllImplementorsOfMultiTrackMix(void)
+{
+    NSString *selName = @"inputAudioMultiTrackDataChannelId:audioFrameArray:needPlay:needMixRtc:needMixLiveStream:timestamp:";
+    SEL sel = NSSelectorFromString(selName);
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    count = objc_getClassList(classes, count);
+
+    int hooked = 0;
+    for (int i = 0; i < count; i++) {
+        Class cls = classes[i];
+        if (!class_respondsToSelector(cls, sel)) continue;
+        Method m = class_getInstanceMethod(cls, sel);
+        const char *enc = m ? method_getTypeEncoding(m) : NULL;
+        if (!enc) continue;
+
+        IMP orig = method_getImplementation(m);
+        if (enc[0] == 'i') {
+            IMP repl = imp_implementationWithBlock(^int(id obj, id channelId, id frames,
+                                                       char needPlay, char needMixRtc,
+                                                       char needMixLiveStream, long long ts) {
+                gKuaishouRtc = (__bridge void *)obj;
+                if (!gKuaishouFrameInfo) {
+                    id first = [frames isKindOfClass:[NSArray class]] ? [frames firstObject] : frames;
+                    if (first) {
+                        gKuaishouFrameInfo = [VCamDescribeObject(first) copy];
+                        VCamTrace(@"抓到快手混音帧对象（int 版）");
+                    }
+                }
+                return ((int (*)(id, SEL, id, id, char, char, char, long long))orig)(
+                    obj, sel, channelId, frames, needPlay, needMixRtc, needMixLiveStream, ts);
+            });
+            class_replaceMethod(cls, sel, repl, enc);
+            hooked += 1;
+        } else if (enc[0] == 'v') {
+            IMP repl = imp_implementationWithBlock(^(id obj, id channelId, id frames,
+                                                    char needPlay, char needMixRtc,
+                                                    char needMixLiveStream, long long ts) {
+                gKuaishouRtc = (__bridge void *)obj;
+                if (!gKuaishouFrameInfo) {
+                    id first = [frames isKindOfClass:[NSArray class]] ? [frames firstObject] : frames;
+                    if (first) {
+                        gKuaishouFrameInfo = [VCamDescribeObject(first) copy];
+                        VCamTrace(@"抓到快手混音帧对象（void 版）");
+                    }
+                }
+                ((void (*)(id, SEL, id, id, char, char, char, long long))orig)(
+                    obj, sel, channelId, frames, needPlay, needMixRtc, needMixLiveStream, ts);
+            });
+            class_replaceMethod(cls, sel, repl, enc);
+            hooked += 1;
+        }
+    }
+    free(classes);
+    VCamTrace(@"多轨混音入口共替换 %d 个实现类", hooked);
+}
 // 装上快手侧的探针：只观察，不改变行为
 static void VCamInstallKuaishouHooks(void)
 {
+    // 先覆盖「所有实现类」，避免只命中接口代理类
+    VCamHookAllImplementorsOfInputSpeakerAudioFrame();
+    VCamHookAllImplementorsOfMultiTrackMix();
+
     Class engine = objc_getClass("KuaishouRtcEngine");
     if (!engine) {
         VCamTrace(@"快手 RTC 引擎不存在（当前不是快手进程）");
