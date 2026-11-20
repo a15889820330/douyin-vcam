@@ -705,6 +705,62 @@ static NSString *VCamScanAudioAPIs(void)
     return out;
 }
 
+// 按方法名反查：哪些类实现了这个方法（用于快手这种 Kotlin/Native 架构）
+static NSString *VCamFindImplementors(void)
+{
+    NSArray *selectors = @[
+        @"inputRawAudioFrameFrame:",
+        @"inputSpeakerAudioFrame:",
+        @"inputAudioMultiTrackDataChannelId:audioFrameArray:needPlay:needMixRtc:needMixLiveStream:timestamp:",
+        @"setPartnerAudioFrame:",
+        @"muteMicrophone",
+        @"unmuteMicrophone",
+        @"startAudioCapture",
+        @"stopAudioCapture",
+        @"setMicrophoneMute:",
+        @"enableAudioInternalRecording",
+        @"recordAudio",
+        @"inputAudioTrackData:audioFrameArray:",
+    ];
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 六、按方法名反查实现类 ==\n"];
+
+    int count = objc_getClassList(NULL, 0);
+    if (count <= 0) return out;
+    Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
+    count = objc_getClassList(classes, count);
+
+    for (NSString *selName in selectors) {
+        SEL sel = NSSelectorFromString(selName);
+        [out appendFormat:@"\n--- %@ ---\n", selName];
+        BOOL any = NO;
+
+        for (int i = 0; i < count; i++) {
+            Class cls = classes[i];
+            const char *cn = class_getName(cls);
+            if (!cn) continue;
+            NSString *clsName = [NSString stringWithUTF8String:cn];
+            if ([clsName hasPrefix:@"NS"] || [clsName hasPrefix:@"UI"] ||
+                [clsName hasPrefix:@"AV"] || [clsName hasPrefix:@"__"] ||
+                [clsName hasPrefix:@"OS_"] || [clsName hasPrefix:@"Swift"] ||
+                [clsName hasPrefix:@"KSKNSKC"]) {
+                continue;
+            }
+            if (!class_respondsToSelector(cls, sel)) continue;
+
+            Method m = class_getInstanceMethod(cls, sel);
+            [out appendFormat:@"  %@\n     %s\n", clsName, m ? method_getTypeEncoding(m) : "(null)"];
+            any = YES;
+        }
+
+        if (!any) [out appendString:@"  （没有类实现）\n"];
+    }
+
+    free(classes);
+    return out;
+}
+
 static NSString *VCamAudioReport(void)
 {
     NSMutableString *out = [NSMutableString string];
@@ -788,6 +844,7 @@ static NSString *VCamAudioReport(void)
     [out appendString:VCamDumpSignatures(@"BAudioKitObjcAudioDeviceModule", pushSel)];
 
     [out appendString:VCamScanAudioAPIs()];
+    [out appendString:VCamFindImplementors()];
 
     return out;
 }
