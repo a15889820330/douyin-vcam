@@ -2239,7 +2239,9 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 #import <math.h>
 #import <string.h>
 
-static const BOOL kEnableAudioUnitHook = YES;
+// 底层 AudioUnit 拦截已永久关闭：在快手上两次导致闪退（2026-11-21）
+// 保留代码供以后研究，但不再启用
+static const BOOL kEnableAudioUnitHook = NO;
 
 // —— PCM 交换缓冲：网络线程写，音频线程读，纯 C 数据，不做任何 Objective-C 操作 ——
 
