@@ -1,4 +1,4 @@
-﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -2219,7 +2219,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 @end
 
-﻿// ======================= 底层音频拦截（AudioUnitRender） =======================
+// ======================= 底层音频拦截（AudioUnitRender） =======================
 //
 // 稳定要点：
 //   1. 重绑定只改「当前值确实等于真实 AudioUnitRender 地址」的槽位（用 dlsym 校验）
