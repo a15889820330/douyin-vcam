@@ -93,6 +93,7 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
 @property (atomic, assign) NSUInteger frameCount;
 @property (atomic, assign) BOOL reportedLoaded;
 @property (atomic, copy) NSString *diagReason;
+@property (atomic, copy) NSString *lastReason;
 + (instancetype)shared;
 - (void)start;
 - (void)stop;
@@ -205,16 +206,20 @@ static NSString *VCamFourCC(FourCharCode code)
     return [NSString stringWithUTF8String:s];
 }
 
-static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
+static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTimeInterval age,
                            FourCharCode subtype, CMVideoDimensions dims)
 {
-    static BOOL shown = NO;
-    if (shown) return;
-    shown = YES;
+    static NSMutableSet *shownKeys = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ shownKeys = [NSMutableSet set]; });
+    @synchronized (shownKeys) {
+        if ([shownKeys containsObject:key]) return;
+        [shownKeys addObject:key];
+    }
 
     NSString *msg = [NSString stringWithFormat:
-        @"首帧诊断\n\n结果：%@\n原帧格式：%@  %dx%d\n有电脑画面：%@（延迟 %.1f 秒）",
-        reason,
+        @"诊断[%@]\n\n结果：%@\n原帧格式：%@  %dx%d\n有电脑画面：%@（延迟 %.1f 秒）",
+        key, reason,
         VCamFourCC(subtype), dims.width, dims.height,
         jpeg.length ? @"有" : @"没有", age];
     VCamShowAlert(msg, YES);
@@ -224,51 +229,47 @@ static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
 
 - (CMSampleBufferRef)copySampleBufferForReference:(CMSampleBufferRef)reference CF_RETURNS_RETAINED
 {
-    if (!reference) return NULL;
+    self.lastReason = nil;
+
+    if (!reference) { self.lastReason = @"没有原始帧"; return NULL; }
 
     NSData *jpeg = self.latestJPEG;
-    if (!jpeg.length) return NULL;
+    if (!jpeg.length) { self.lastReason = @"还没收到电脑画面"; return NULL; }
 
     // 断流了，回落真实摄像头
     NSTimeInterval age = [NSDate timeIntervalSinceReferenceDate] - self.latestAt;
-    if (age > kStaleSeconds) return NULL;
+    if (age > kStaleSeconds) { self.lastReason = @"电脑画面太旧（断流）"; return NULL; }
 
     // 关键：拿原帧的格式描述，按它的尺寸/像素格式/时间戳来造，下游才不会因为不匹配而崩
     CMFormatDescriptionRef fmtRef = CMSampleBufferGetFormatDescription(reference);
-    if (!fmtRef) return NULL;
+    if (!fmtRef) { self.lastReason = @"原帧没有格式描述"; return NULL; }
     CMVideoDimensions dims = CMVideoFormatDescriptionGetDimensions(fmtRef);
     FourCharCode subtype = CMFormatDescriptionGetMediaSubType(fmtRef);
-    if (dims.width <= 0 || dims.height <= 0) return NULL;
+    if (dims.width <= 0 || dims.height <= 0) { self.lastReason = @"原帧尺寸异常"; return NULL; }
 
     BOOL supported = (subtype == kCVPixelFormatType_420YpCbCr8BiPlanarFullRange ||
                       subtype == kCVPixelFormatType_420YpCbCr8BiPlanarVideoRange ||
                       subtype == kCVPixelFormatType_32BGRA);
     if (!supported) {
-        // 不认识的格式就直接放行原帧，宁可不替换也别崩
-        static BOOL warnedOnce = NO;
-        if (!warnedOnce) {
-            warnedOnce = YES;
-            NSLog(@"[vcam] 不支持的像素格式 %c%c%c%c，回落到真实摄像头",
-                  (char)((subtype >> 24) & 0xff), (char)((subtype >> 16) & 0xff),
-                  (char)((subtype >> 8) & 0xff), (char)(subtype & 0xff));
-        }
+        // 不认识的格式就放行原帧，宁可不替换也别崩
+        self.lastReason = [NSString stringWithFormat:@"像素格式 %@ 不在支持列表", VCamFourCC(subtype)];
         return NULL;
     }
 
     CGImageSourceRef source = CGImageSourceCreateWithData((__bridge CFDataRef)jpeg, NULL);
-    if (!source) return NULL;
+    if (!source) { self.lastReason = @"JPEG 读取失败"; return NULL; }
     CGImageRef image = CGImageSourceCreateImageAtIndex(source, 0, NULL);
     CFRelease(source);
-    if (!image) return NULL;
+    if (!image) { self.lastReason = @"JPEG 解码失败"; return NULL; }
 
     CIImage *ciImage = [CIImage imageWithCGImage:image];
     CGImageRelease(image);
-    if (!ciImage) return NULL;
+    if (!ciImage) { self.lastReason = @"CIImage 创建失败"; return NULL; }
 
     // 等比缩放并居中（contain），保证画面完整不裁切
     CGFloat srcW = ciImage.extent.size.width;
     CGFloat srcH = ciImage.extent.size.height;
-    if (srcW <= 0 || srcH <= 0) return NULL;
+    if (srcW <= 0 || srcH <= 0) { self.lastReason = @"电脑画面尺寸异常"; return NULL; }
     CGFloat scale = MIN(dims.width / srcW, dims.height / srcH);
     CGFloat dx = (dims.width - srcW * scale) / 2.0;
     CGFloat dy = (dims.height - srcH * scale) / 2.0;
@@ -283,7 +284,10 @@ static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
     CVPixelBufferRef pixelBuffer = NULL;
     CVReturn st = CVPixelBufferCreate(kCFAllocatorDefault, (size_t)dims.width, (size_t)dims.height,
                                       subtype, (__bridge CFDictionaryRef)attrs, &pixelBuffer);
-    if (st != kCVReturnSuccess || !pixelBuffer) return NULL;
+    if (st != kCVReturnSuccess || !pixelBuffer) {
+        self.lastReason = [NSString stringWithFormat:@"像素缓冲创建失败(%d)", (int)st];
+        return NULL;
+    }
 
     @try {
         [self.ciContext render:scaled
@@ -291,7 +295,7 @@ static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
                       bounds:CGRectMake(0, 0, dims.width, dims.height)
                   colorSpace:CGColorSpaceCreateDeviceRGB()];
     } @catch (NSException *e) {
-        NSLog(@"[vcam] 渲染失败: %@", e.reason);
+        self.lastReason = [NSString stringWithFormat:@"渲染异常：%@", e.reason];
         CVPixelBufferRelease(pixelBuffer);
         return NULL;
     }
@@ -310,7 +314,12 @@ static void VCamReportDiag(NSString *reason, NSData *jpeg, NSTimeInterval age,
     OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault, pixelBuffer, fmtRef,
                                                               &timing, &sampleBuffer);
     CVPixelBufferRelease(pixelBuffer);
-    if (status != noErr || !sampleBuffer) return NULL;
+    if (status != noErr || !sampleBuffer) {
+        self.lastReason = [NSString stringWithFormat:@"CMSampleBuffer 创建失败(%d)", (int)status];
+        return NULL;
+    }
+
+    self.lastReason = @"替换成功";
     return sampleBuffer;
 }
 
@@ -340,20 +349,33 @@ static void VCamSwizzleDelegate(Class cls)
     IMP replacement = imp_implementationWithBlock(^(id self, AVCaptureOutput *output,
                                                    CMSampleBufferRef sampleBuffer,
                                                    AVCaptureConnection *connection) {
-        // 诊断：确认回调真的进了、原帧是什么像素格式、有没有收到电脑画面
+        VCamClient *client = [VCamClient shared];
+
+        // 诊断 1：确认回调真的进了、原帧格式、有没有电脑画面
         static int diagCalls = 0;
         diagCalls += 1;
         if (diagCalls == 1) {
             CMFormatDescriptionRef f = CMSampleBufferGetFormatDescription(sampleBuffer);
             CMVideoDimensions d = f ? CMVideoFormatDescriptionGetDimensions(f) : (CMVideoDimensions){0, 0};
             FourCharCode st = f ? CMFormatDescriptionGetMediaSubType(f) : 0;
-            VCamClient *client = [VCamClient shared];
             NSTimeInterval age = client.latestAt
                 ? ([NSDate timeIntervalSinceReferenceDate] - client.latestAt) : -1;
-            VCamReportDiag(@"回调已进入", client.latestJPEG, age, st, d);
+            VCamReportDiag(@"entry", @"回调已进入", client.latestJPEG, age, st, d);
         }
 
-        CMSampleBufferRef ours = [[VCamClient shared] copySampleBufferForReference:sampleBuffer];
+        CMSampleBufferRef ours = [client copySampleBufferForReference:sampleBuffer];
+
+        // 诊断 2：第 3 次回调时报告替换结果（成功 / 具体卡在哪一步）
+        if (diagCalls == 3) {
+            CMFormatDescriptionRef f = CMSampleBufferGetFormatDescription(sampleBuffer);
+            CMVideoDimensions d = f ? CMVideoFormatDescriptionGetDimensions(f) : (CMVideoDimensions){0, 0};
+            FourCharCode st = f ? CMFormatDescriptionGetMediaSubType(f) : 0;
+            NSTimeInterval age = client.latestAt
+                ? ([NSDate timeIntervalSinceReferenceDate] - client.latestAt) : -1;
+            NSString *reason = client.lastReason ? client.lastReason : @"未知原因";
+            VCamReportDiag(@"result", reason, client.latestJPEG, age, st, d);
+        }
+
         if (ours) {
             ((void (*)(id, SEL, AVCaptureOutput *, CMSampleBufferRef, AVCaptureConnection *))original)(
                 self, sel, output, ours, connection);
