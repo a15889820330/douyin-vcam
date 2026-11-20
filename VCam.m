@@ -29,8 +29,10 @@ static NSString *const kDefaultHost = @"192.168.1.42";
 static const int kFramePort = 9003;
 // 断流多久回落到真实摄像头
 static const NSTimeInterval kStaleSeconds = 2.0;
-// 是否显示调试提示框
-static const BOOL kShowAlerts = YES;
+// 是否显示调试提示框（调好后关掉，只留控制面板）
+static const BOOL kShowAlerts = NO;
+// 是否显示逐帧诊断（排查 hook 时临时打开）
+static const BOOL kShowDiag = NO;
 
 static NSString *VCamHost(void)
 {
@@ -214,6 +216,11 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
     static NSMutableSet *shownKeys = nil;
     static dispatch_once_t once;
     dispatch_once(&once, ^{ shownKeys = [NSMutableSet set]; });
+
+    if (!kShowDiag) {
+        NSLog(@"[vcam] 诊断[%@] %@", key, reason);
+        return;
+    }
     @synchronized (shownKeys) {
         if ([shownKeys containsObject:key]) return;
         [shownKeys addObject:key];
@@ -250,6 +257,12 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
         return NO;
     }
 
+    id enabledObj = [[NSUserDefaults standardUserDefaults] objectForKey:@"vcam_enabled"];
+    if (enabledObj && ![enabledObj boolValue]) {
+        self.lastReason = @"已手动关闭";
+        return NO;
+    }
+
     size_t dstW = CVPixelBufferGetWidth(pixelBuffer);
     size_t dstH = CVPixelBufferGetHeight(pixelBuffer);
     if (dstW == 0 || dstH == 0) {
@@ -283,11 +296,19 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
         self.lastReason = @"电脑画面尺寸异常";
         return NO;
     }
-    CGFloat scale = MIN((CGFloat)dstW / srcW, (CGFloat)dstH / srcH);
+    BOOL fill = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_fill"];
+    BOOL mirror = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_mirror"];
+    CGFloat scale = fill ? MAX((CGFloat)dstW / srcW, (CGFloat)dstH / srcH)
+                         : MIN((CGFloat)dstW / srcW, (CGFloat)dstH / srcH);
     CGFloat dx = ((CGFloat)dstW - srcW * scale) / 2.0;
     CGFloat dy = ((CGFloat)dstH - srcH * scale) / 2.0;
     CIImage *scaled = [ciImage imageByApplyingTransform:CGAffineTransformMakeScale(scale, scale)];
     scaled = [scaled imageByApplyingTransform:CGAffineTransformMakeTranslation(dx, dy)];
+    if (mirror) {
+        CGAffineTransform flip = CGAffineTransformMakeTranslation((CGFloat)dstW, 0);
+        flip = CGAffineTransformScale(flip, -1, 1);
+        scaled = [scaled imageByApplyingTransform:flip];
+    }
 
     // 直接渲染进抖音自己那块缓冲区：格式/尺寸/时间戳都是它原本的，不会不匹配
     @try {
@@ -404,7 +425,251 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
 
 @end
 
-// ======================= Hook（纯 runtime） =======================
+// ======================= 悬浮控制面板（奶油 + 暖黄） =======================
+
+static UIColor *VCamInk(void)    { return [UIColor colorWithRed:0.18 green:0.17 blue:0.14 alpha:1.0]; }
+static UIColor *VCamCard(void)   { return [UIColor colorWithRed:1.00 green:0.99 blue:0.96 alpha:0.97]; }
+static UIColor *VCamAccent(void) { return [UIColor colorWithRed:0.96 green:0.81 blue:0.47 alpha:1.0]; }
+static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 blue:0.49 alpha:1.0]; }
+
+// 触摸穿透的窗口：只有面板本身接收点击，其它区域照常交给抖音
+@interface VCamWindow : UIWindow
+@end
+
+@implementation VCamWindow
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
+{
+    UIView *v = [super hitTest:point withEvent:event];
+    if (v == self || v == self.rootViewController.view || v == nil) return nil;
+    return v;
+}
+@end
+
+@interface VCamOverlay : NSObject
++ (instancetype)shared;
+- (void)install;
+@end
+
+@implementation VCamOverlay {
+    VCamWindow *_window;
+    UIView *_bubble;
+    UIView *_card;
+    UILabel *_statusDot;
+    UILabel *_statusText;
+    UILabel *_footer;
+    UISwitch *_enableSwitch;
+    UISwitch *_mirrorSwitch;
+    UISegmentedControl *_fitSegment;
+    NSTimer *_timer;
+    BOOL _expanded;
+}
+
++ (instancetype)shared
+{
+    static VCamOverlay *o = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{ o = [[VCamOverlay alloc] init]; });
+    return o;
+}
+
+- (BOOL)enabled
+{
+    id v = [[NSUserDefaults standardUserDefaults] objectForKey:@"vcam_enabled"];
+    return v ? [v boolValue] : YES;
+}
+
+- (void)install
+{
+    if (_window) return;
+
+    UIWindowScene *scene = nil;
+    for (UIScene *s in [UIApplication sharedApplication].connectedScenes) {
+        if (![s isKindOfClass:[UIWindowScene class]]) continue;
+        if (s.activationState == UISceneActivationStateForegroundActive) { scene = (UIWindowScene *)s; break; }
+        if (!scene) scene = (UIWindowScene *)s;
+    }
+    if (!scene) {
+        NSLog(@"[vcam] 没有可用的 UIWindowScene，面板不显示");
+        return;
+    }
+
+    _window = [[VCamWindow alloc] initWithWindowScene:scene];
+    _window.windowLevel = UIWindowLevelAlert + 1;
+    _window.backgroundColor = [UIColor clearColor];
+    _window.rootViewController = [UIViewController new];
+    _window.rootViewController.view.backgroundColor = [UIColor clearColor];
+    _window.hidden = NO;
+
+    [self buildBubble];
+    [self buildCard];
+
+    _timer = [NSTimer scheduledTimerWithTimeInterval:1.0
+                                              target:self
+                                            selector:@selector(refreshStatus)
+                                            userInfo:nil
+                                             repeats:YES];
+    NSLog(@"[vcam] 控制面板已显示");
+}
+
+- (void)buildBubble
+{
+    CGFloat size = 48;
+    CGFloat x = _window.bounds.size.width - size - 14;
+    CGFloat y = 120;
+    _bubble = [[UIView alloc] initWithFrame:CGRectMake(x, y, size, size)];
+    _bubble.backgroundColor = VCamCard();
+    _bubble.layer.cornerRadius = size / 2.0;
+    _bubble.layer.shadowColor = [UIColor blackColor].CGColor;
+    _bubble.layer.shadowOpacity = 0.18;
+    _bubble.layer.shadowRadius = 8;
+    _bubble.layer.shadowOffset = CGSizeMake(0, 3);
+
+    UILabel *cat = [[UILabel alloc] initWithFrame:_bubble.bounds];
+    cat.text = @"🐱";
+    cat.font = [UIFont systemFontOfSize:22];
+    cat.textAlignment = NSTextAlignmentCenter;
+    cat.userInteractionEnabled = NO;
+    [_bubble addSubview:cat];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(toggleCard)];
+    [_bubble addGestureRecognizer:tap];
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [_bubble addGestureRecognizer:pan];
+
+    [_window.rootViewController.view addSubview:_bubble];
+}
+
+- (UILabel *)makeLabel:(NSString *)text frame:(CGRect)frame size:(CGFloat)size bold:(BOOL)bold
+{
+    UILabel *l = [[UILabel alloc] initWithFrame:frame];
+    l.text = text;
+    l.textColor = VCamInk();
+    l.font = bold ? [UIFont boldSystemFontOfSize:size] : [UIFont systemFontOfSize:size];
+    return l;
+}
+
+- (void)buildCard
+{
+    CGFloat w = 236, h = 208;
+    CGFloat x = _window.bounds.size.width - w - 14;
+    CGFloat y = 120;
+    _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
+    _card.backgroundColor = VCamCard();
+    _card.layer.cornerRadius = 18;
+    _card.layer.shadowColor = [UIColor blackColor].CGColor;
+    _card.layer.shadowOpacity = 0.2;
+    _card.layer.shadowRadius = 14;
+    _card.layer.shadowOffset = CGSizeMake(0, 6);
+    _card.hidden = YES;
+
+    UILabel *title = [self makeLabel:@"虚拟摄像头" frame:CGRectMake(16, 14, 150, 22) size:15 bold:YES];
+    [_card addSubview:title];
+
+    UIButton *collapse = [UIButton buttonWithType:UIButtonTypeSystem];
+    collapse.frame = CGRectMake(w - 44, 10, 32, 30);
+    [collapse setTitle:@"—" forState:UIControlStateNormal];
+    [collapse setTitleColor:VCamMuted() forState:UIControlStateNormal];
+    [collapse addTarget:self action:@selector(toggleCard) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:collapse];
+
+    _statusDot = [self makeLabel:@"●" frame:CGRectMake(16, 42, 14, 18) size:12 bold:NO];
+    _statusDot.textColor = VCamMuted();
+    [_card addSubview:_statusDot];
+    _statusText = [self makeLabel:@"未连接" frame:CGRectMake(32, 42, 190, 18) size:12 bold:NO];
+    _statusText.textColor = VCamMuted();
+    [_card addSubview:_statusText];
+
+    // 替换画面
+    [_card addSubview:[self makeLabel:@"替换画面" frame:CGRectMake(16, 72, 120, 24) size:13.5 bold:YES]];
+    _enableSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 68, 52, 32)];
+    _enableSwitch.onTintColor = VCamAccent();
+    _enableSwitch.on = [self enabled];
+    [_enableSwitch addTarget:self action:@selector(enableChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_enableSwitch];
+
+    // 镜像
+    [_card addSubview:[self makeLabel:@"左右镜像" frame:CGRectMake(16, 108, 120, 24) size:13.5 bold:YES]];
+    _mirrorSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 104, 52, 32)];
+    _mirrorSwitch.onTintColor = VCamAccent();
+    _mirrorSwitch.on = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_mirror"];
+    [_mirrorSwitch addTarget:self action:@selector(mirrorChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_mirrorSwitch];
+
+    // 画面适配
+    [_fitSegment removeFromSuperview];
+    _fitSegment = [[UISegmentedControl alloc] initWithItems:@[ @"等比", @"填充" ]];
+    _fitSegment.frame = CGRectMake(16, 142, w - 32, 30);
+    _fitSegment.selectedSegmentIndex = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_fill"] ? 1 : 0;
+    _fitSegment.tintColor = VCamAccent();
+    [_fitSegment addTarget:self action:@selector(fitChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_fitSegment];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 178, w - 32, 18) size:11 bold:NO];
+    _footer.textColor = VCamMuted();
+    [_card addSubview:_footer];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [title addGestureRecognizer:pan];
+    title.userInteractionEnabled = YES;
+
+    [_window.rootViewController.view addSubview:_card];
+}
+
+- (void)toggleCard
+{
+    _expanded = !_expanded;
+    _card.hidden = !_expanded;
+    _bubble.hidden = _expanded;
+}
+
+- (void)handlePan:(UIPanGestureRecognizer *)pan
+{
+    UIView *target = (_expanded ? _card : _bubble);
+    CGPoint delta = [pan translationInView:_window];
+    CGRect f = target.frame;
+    f.origin.x += delta.x;
+    f.origin.y += delta.y;
+    f.origin.x = MAX(4, MIN(f.origin.x, _window.bounds.size.width - f.size.width - 4));
+    f.origin.y = MAX(60, MIN(f.origin.y, _window.bounds.size.height - f.size.height - 40));
+    target.frame = f;
+    [pan setTranslation:CGPointZero inView:_window];
+}
+
+- (void)enableChanged:(UISwitch *)s
+{
+    [[NSUserDefaults standardUserDefaults] setBool:s.on forKey:@"vcam_enabled"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    NSLog(@"[vcam] 替换画面 -> %@", s.on ? @"开" : @"关");
+}
+
+- (void)mirrorChanged:(UISwitch *)s
+{
+    [[NSUserDefaults standardUserDefaults] setBool:s.on forKey:@"vcam_mirror"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)fitChanged:(UISegmentedControl *)seg
+{
+    [[NSUserDefaults standardUserDefaults] setBool:seg.selectedSegmentIndex == 1 forKey:@"vcam_fill"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)refreshStatus
+{
+    if (!_statusText) return;
+    VCamClient *c = [VCamClient shared];
+    BOOL connected = c.latestAt > 0 &&
+        ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) < kStaleSeconds;
+    _statusDot.textColor = connected ? [UIColor colorWithRed:0.55 green:0.66 blue:0.44 alpha:1.0] : VCamMuted();
+    _statusText.text = connected ? @"已连接电脑" : @"未连接";
+    _footer.text = [NSString stringWithFormat:@"已接收 %lu 帧 · 延迟 %.1fs",
+                    (unsigned long)c.frameCount,
+                    c.latestAt ? ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) : 0.0];
+}
+
+@end
+
+// ======================= Hook =======================
 
 static NSMutableSet *gSwizzledClasses;
 
@@ -504,12 +769,11 @@ static void VCamInit(void)
         NSLog(@"[vcam] dylib 已加载，目标 %@:%d", VCamHost(), kFramePort);
         VCamInstallHooks();
 
-        // 加载后 2 秒弹提示：看到这个框就说明 dylib 真的进去了
+        // 加载后 2 秒：开始收帧 + 弹出控制面板
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        dispatch_get_main_queue(), ^{
-            VCamShowAlert([NSString stringWithFormat:@"插件已加载，正在连接电脑 %@:%d", VCamHost(), kFramePort],
-                          YES);
             [[VCamClient shared] start];
+            [[VCamOverlay shared] install];
         });
     }
 }
