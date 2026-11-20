@@ -824,7 +824,31 @@ static NSString *VCamFindImplementors(void)
 static NSString *VCamKuaishouReport(void);
 static NSString *VCamKuaishouDeepReport(void);
 static NSString *VCamKuaishouCaptureReport(void);
+// 扫描快手/AudioToolbox 相关 C 函数，看它到底用哪一套
+static NSString *VCamSymbolScanReport(void)
+{
+    NSArray *names = @[
+        @"AudioUnitRender", @"AudioUnitSetProperty", @"AudioUnitGetProperty",
+        @"AudioComponentInstanceNew", @"AudioComponentInstanceNewWithOptions",
+        @"AudioQueueNewInput", @"AudioQueueNewInputWithDispatchQueue",
+        @"AudioQueueAllocateBuffer", @"AudioQueueEnqueueBuffer", @"AudioQueueStart",
+        @"AudioSessionSetActive", @"AudioUnitSetParameter",
+    ];
+
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 十一、音频 C 函数引用扫描 ==\n"];
+    [out appendString:@"（命中=0 表示该 App 二进制里完全没有引用这个函数）\n"];
+    for (NSString *name in names) {
+        const char *cname = [name UTF8String];
+        void *addr = dlsym(RTLD_DEFAULT, cname);
+        int hits = VCamCountSymbolHits(cname);
+        [out appendFormat:@"  %-34s 地址=%p  命中=%d\n", cname, addr, hits];
+    }
+    return out;
+}
+
 static NSString *VCamRuntimeLogReport(void);
+static int VCamCountSymbolHits(const char *symbol);
 
 static NSString *VCamAudioReport(void)
 {
@@ -914,6 +938,7 @@ static NSString *VCamAudioReport(void)
     [out appendString:VCamKuaishouDeepReport()];
     [out appendString:VCamKuaishouCaptureReport()];
     [out appendString:VCamRuntimeLogReport()];
+    [out appendString:VCamSymbolScanReport()];
 
     return out;
 }
@@ -2400,6 +2425,7 @@ static OSStatus (*gOrigAudioUnitRender)(AudioUnit, UInt32, const AudioTimeStamp 
 static int gRenderCalls = 0;
 static int gSymbolNameHits = 0;      // 符号表里名字命中的槽位数
 static int gSymbolRealFound = 0;     // dlsym 是否拿到真实地址
+static int gWalkOnly = 0;            // 1=只统计符号命中，不修改
 static int gRenderFills = 0;
 
 // 只改「确实指向 symbol 真实地址」的槽位
@@ -2425,8 +2451,9 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
         if (mainHandle) { real = dlsym(mainHandle, symbol); how = "主程序句柄"; }
     }
     VCamLogLine([NSString stringWithFormat:@"解析 %s 用 %s -> %p", symbol, how, real]);
-    if (!real) return 0;
-    gSymbolRealFound = 1;
+    if (!real && !gWalkOnly) return 0;
+    if (real) gSymbolRealFound = 1;
+    if (gWalkOnly && !real) real = (void *)-1;   // 巡览模式用占位值继续
 
     int patched = 0;
     uint32_t imageCount = _dyld_image_count();
@@ -2505,7 +2532,7 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                     // 名字匹配即替换：延迟绑定的槽位此时可能还是桩函数，
                     // 原实现统一用 dlsym 拿到的真实地址
                     if (original) *original = real;
-                    if (slots[k] != replacement) {
+                    if (!gWalkOnly && slots[k] != replacement) {
                         slots[k] = replacement;
                         patched += 1;
                     }
@@ -2515,6 +2542,17 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
         }
     }
     return patched;
+}
+
+// 只统计某个符号在所有镜像里的命中数
+static int VCamCountSymbolHits(const char *symbol)
+{
+    gWalkOnly = 1;
+    gSymbolNameHits = 0;
+    VCamRebindSymbol(symbol, NULL, NULL);
+    int hits = gSymbolNameHits;
+    gWalkOnly = 0;
+    return hits;
 }
 
 static VCamUnitInfo *VCamInfoForUnit(AudioUnit unit, int create)
