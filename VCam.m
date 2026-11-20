@@ -1,4 +1,4 @@
-﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -517,7 +517,79 @@ static void VCamInstallAudioProbes(void)
         }
     }
 
+    // 4) AVAudioSession 的其它常见调用方式（上一版漏了这些）
+    if (session) {
+        SEL sel2 = @selector(setCategory:error:);
+        Method m2 = class_getInstanceMethod(session, sel2);
+        if (m2) {
+            IMP o2 = method_getImplementation(m2);
+            IMP r2 = imp_implementationWithBlock(^BOOL(id obj, NSString *cat, NSError **err) {
+                VCamTrace(@"AVAudioSession setCategory:%@ error:", cat);
+                return ((BOOL (*)(id, SEL, NSString *, NSError **))o2)(obj, sel2, cat, err);
+            });
+            class_replaceMethod(session, sel2, r2, method_getTypeEncoding(m2));
+        }
+
+        SEL sel3 = @selector(setActive:error:);
+        Method m3 = class_getInstanceMethod(session, sel3);
+        if (m3) {
+            IMP o3 = method_getImplementation(m3);
+            IMP r3 = imp_implementationWithBlock(^BOOL(id obj, BOOL active, NSError **err) {
+                VCamTrace(@"AVAudioSession setActive:%d", (int)active);
+                return ((BOOL (*)(id, SEL, BOOL, NSError **))o3)(obj, sel3, active, err);
+            });
+            class_replaceMethod(session, sel3, r3, method_getTypeEncoding(m3));
+        }
+
+        SEL sel4 = @selector(setMode:error:);
+        Method m4 = class_getInstanceMethod(session, sel4);
+        if (m4) {
+            IMP o4 = method_getImplementation(m4);
+            IMP r4 = imp_implementationWithBlock(^BOOL(id obj, NSString *mode, NSError **err) {
+                VCamTrace(@"AVAudioSession setMode:%@", mode);
+                return ((BOOL (*)(id, SEL, NSString *, NSError **))o4)(obj, sel4, mode, err);
+            });
+            class_replaceMethod(session, sel4, r4, method_getTypeEncoding(m4));
+        }
+    }
+
     VCamTrace(@"音频探针已安装");
+}
+
+// 针对重点类，把跟音频采集/处理相关的方法列出来
+static NSString *VCamDumpClassMethods(NSString *className)
+{
+    Class cls = objc_getClass([className UTF8String]);
+    if (!cls) return [NSString stringWithFormat:@"\n== %@ ==\n  （类不存在）\n", className];
+
+    NSMutableString *s = [NSMutableString stringWithFormat:@"\n== %@ ==\n", className];
+    unsigned int total = 0;
+    Method *methods = class_copyMethodList(cls, &total);
+    NSMutableArray *matched = [NSMutableArray array];
+    for (unsigned int i = 0; i < total; i++) {
+        NSString *sel = NSStringFromSelector(method_getName(methods[i]));
+        NSString *low = [sel lowercaseString];
+        if ([low rangeOfString:@"audio"].location != NSNotFound ||
+            [low rangeOfString:@"capture"].location != NSNotFound ||
+            [low rangeOfString:@"input"].location != NSNotFound ||
+            [low rangeOfString:@"frame"].location != NSNotFound ||
+            [low rangeOfString:@"pcm"].location != NSNotFound ||
+            [low rangeOfString:@"render"].location != NSNotFound ||
+            [low rangeOfString:@"start"].location != NSNotFound ||
+            [low rangeOfString:@"stop"].location != NSNotFound ||
+            [low rangeOfString:@"observer"].location != NSNotFound) {
+            [matched addObject:sel];
+        }
+    }
+    free(methods);
+    [matched sortUsingSelector:@selector(compare:)];
+    for (NSString *sel in matched) {
+        [s appendFormat:@"  - %@\n", sel];
+    }
+    Class sup = class_getSuperclass(cls);
+    [s appendFormat:@"  （共 %u 个方法，列出 %lu 个；父类 %s）\n",
+     total, (unsigned long)matched.count, sup ? class_getName(sup) : "-"];
+    return s;
 }
 
 static NSString *VCamAudioReport(void)
@@ -535,26 +607,55 @@ static NSString *VCamAudioReport(void)
         }
     }
 
-    [out appendString:@"\n== 二、类名含 Audio 的类 ==\n"];
+    [out appendString:@"\n== 二、重点类的方法 ==\n"];
+    NSArray *targets = @[
+        @"IESLiveAudioCapturerImp",
+        @"IESLiveAudioCaptureHookHelper",
+        @"IESLiveAudioCaptureRequest",
+        @"IESLiveRecoderImp_douyinAudioHookHelper",
+        @"IESMMAudioCapture",
+        @"LSLiveAudioUnitProcess",
+        @"LSLiveAudioUnitConfig",
+        @"LiveStreamAudioCapture",
+        @"LiveStreamAudioRecord",
+        @"LSAudioBufferQueue",
+        @"LiveCoreAudioBufferQueue",
+        @"BDAudioKitObjcAudioDeviceSource",
+        @"BDAudioKitObjcAudioDeviceModule",
+        @"BAudioKitObjcAudioDeviceSource",
+        @"BAudioKitObjcAudioDeviceModule",
+        @"ATSAudioOfIESLiveAudioCapturePipeline",
+    ];
+    for (NSString *name in targets) {
+        [out appendString:VCamDumpClassMethods(name)];
+    }
+
+    [out appendString:@"\n== 三、类名含 Audio 的业务类（已过滤，最多 120 个）==\n"];
     int count = objc_getClassList(NULL, 0);
     if (count > 0) {
         Class *classes = (Class *)malloc(sizeof(Class) * (size_t)count);
         count = objc_getClassList(classes, count);
         NSMutableArray *names = [NSMutableArray array];
+        NSArray *prefixes = @[ @"IES", @"LS", @"BD", @"AWE", @"AT", @"BA", @"CG", @"LM", @"LC", @"Live", @"TT" ];
         for (int i = 0; i < count; i++) {
             const char *n = class_getName(classes[i]);
             if (!n) continue;
             NSString *name = [NSString stringWithUTF8String:n];
-            if ([name rangeOfString:@"audio" options:NSCaseInsensitiveSearch].location != NSNotFound) {
-                [names addObject:name];
+            if ([name rangeOfString:@"audio" options:NSCaseInsensitiveSearch].location == NSNotFound) continue;
+            BOOL keep = NO;
+            for (NSString *p in prefixes) {
+                if ([name hasPrefix:p]) { keep = YES; break; }
             }
+            if (keep) [names addObject:name];
         }
         free(classes);
         [names sortUsingSelector:@selector(compare:)];
-        for (NSString *n in names) {
-            [out appendFormat:@"%@\n", n];
+        NSUInteger limit = MIN(names.count, (NSUInteger)120);
+        for (NSUInteger i = 0; i < limit; i++) {
+            [out appendFormat:@"%@\n", names[i]];
         }
-        [out appendFormat:@"\n（共 %lu 个）\n", (unsigned long)names.count];
+        [out appendFormat:@"\n（命中 %lu 个，已列出 %lu 个）\n",
+         (unsigned long)names.count, (unsigned long)limit];
     }
 
     return out;
