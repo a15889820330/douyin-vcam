@@ -310,6 +310,14 @@ static void VCamSwizzleDelegate(Class cls)
 
     class_replaceMethod(cls, sel, replacement, method_getTypeEncoding(method));
     NSLog(@"[vcam] 已接管 %@ 的帧回调", NSStringFromClass(cls));
+
+    static BOOL reportedSwizzle = NO;
+    if (!reportedSwizzle) {
+        reportedSwizzle = YES;
+        VCamShowAlert([NSString stringWithFormat:@"已接管 %@ 的采集回调\n\n如果画面还是真实摄像头，说明抖音没走这个回调。",
+                                                 NSStringFromClass(cls)],
+                      YES);
+    }
 }
 
 static void VCamInstallHooks(void)
