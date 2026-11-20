@@ -825,6 +825,8 @@ static NSString *VCamFindImplementors(void)
 static NSString *VCamKuaishouReport(void);
 static NSString *VCamKuaishouDeepReport(void);
 static NSString *VCamKuaishouCaptureReport(void);
+static int VCamCountSymbolHits(const char *symbol);
+
 // 扫描快手/AudioToolbox 相关 C 函数，看它到底用哪一套
 static NSString *VCamSymbolScanReport(void)
 {
@@ -849,7 +851,6 @@ static NSString *VCamSymbolScanReport(void)
 }
 
 static NSString *VCamRuntimeLogReport(void);
-static int VCamCountSymbolHits(const char *symbol);
 
 static NSString *VCamAudioReport(void)
 {
