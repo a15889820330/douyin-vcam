@@ -1,0 +1,42 @@
+name: build-dylib
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 Theos
+        run: |
+          git clone --recursive --depth=1 https://github.com/theos/theos.git "$RUNNER_TEMP/theos"
+          echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/theos/bin" >> "$GITHUB_PATH"
+
+      - name: 安装 iOS SDK
+        run: |
+          git clone --depth=1 https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          SDK=$(ls "$RUNNER_TEMP/sdks" | grep '^iPhoneOS' | sort -V | tail -1)
+          echo "使用 SDK: $SDK"
+          cp -R "$RUNNER_TEMP/sdks/$SDK" "$THEOS/sdks/"
+
+      - name: 编译
+        run: make -j4
+
+      - name: 收集产物
+        run: |
+          mkdir -p out
+          find .theos -name '*.dylib' -print
+          find .theos -name '*.dylib' -exec cp {} out/ \;
+          ls -lh out
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: DouyinVCam-dylib
+          path: out/*.dylib
+          if-no-files-found: error
