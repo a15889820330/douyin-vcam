@@ -1,4 +1,4 @@
-﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -1148,11 +1148,11 @@ static NSString *VCamDescribeCaptureSession(void)
 static NSString *VCamKuaishouCaptureReport(void)
 {
     NSMutableString *out = [NSMutableString string];
-    [out appendString:@"\n== 九、快手麦克风采集回调 ==\n@"];
-    [out appendString:gKwCaptureInfo ?: @"（还没捕获：进直播画面后再看这里）\n@"];
+    [out appendString:@"\n== 九、快手麦克风采集回调 ==\n"];
+    [out appendString:gKwCaptureInfo ?: @"（还没捕获：进直播画面后再看这里）\n"];
     if (!gKwCaptureInfo) {
         [out appendString:VCamDescribeCaptureSession()];
-        [out appendString:@"\n@"];
+        [out appendString:@"\n"];
     }
     return out;
 }
