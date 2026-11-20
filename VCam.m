@@ -1,4 +1,4 @@
-// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -762,6 +762,7 @@ static NSString *VCamFindImplementors(void)
 }
 
 static NSString *VCamKuaishouReport(void);
+static NSString *VCamKuaishouDeepReport(void);
 
 static NSString *VCamAudioReport(void)
 {
@@ -848,6 +849,7 @@ static NSString *VCamAudioReport(void)
     [out appendString:VCamScanAudioAPIs()];
     [out appendString:VCamFindImplementors()];
     [out appendString:VCamKuaishouReport()];
+    [out appendString:VCamKuaishouDeepReport()];
 
     return out;
 }
@@ -1028,6 +1030,62 @@ static void VCamHookAllImplementorsOfMultiTrackMix(void)
     free(classes);
     VCamTrace(@"多轨混音入口共替换 %d 个实现类", hooked);
 }
+// 打印某个类的完整方法列表（不按关键词过滤）
+static NSString *VCamDumpAllMethods(NSString *className, NSUInteger limit)
+{
+    Class cls = objc_getClass([className UTF8String]);
+    if (!cls) return [NSString stringWithFormat:@"\n%@: （类不存在）\n", className];
+
+    NSMutableString *s = [NSMutableString stringWithFormat:@"\n%@:\n", className];
+    unsigned int total = 0;
+    Method *methods = class_copyMethodList(cls, &total);
+    NSMutableArray *names = [NSMutableArray array];
+    for (unsigned int i = 0; i < total; i++) {
+        [names addObject:[NSString stringWithFormat:@"  - %@   [%s]",
+                          NSStringFromSelector(method_getName(methods[i])),
+                          method_getTypeEncoding(methods[i]) ?: ""]];
+    }
+    free(methods);
+    [names sortUsingSelector:@selector(compare:)];
+    NSUInteger n = MIN(names.count, limit);
+    for (NSUInteger i = 0; i < n; i++) [s appendFormat:@"%@\n", names[i]];
+    [s appendFormat:@"  （共 %u 个，列出 %lu）\n", total, (unsigned long)n];
+    return s;
+}
+
+static NSString *VCamKuaishouDeepReport(void)
+{
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 八、快手音频相关类完整方法 ==\n"];
+
+    for (NSString *name in @[ @"KWDAudioCaptureSession", @"AemonAudioUnitController",
+                              @"AemonAudioQueueController", @"KWDaenerysAudioController",
+                              @"KSCameraCoreService" ]) {
+        [out appendString:VCamDumpAllMethods(name, 60)];
+    }
+
+    // 刨一下 sharedInstance 拿到什么
+    Class ctxCls = objc_getClass("KuaishouRtcEngineContext");
+    if (ctxCls) {
+        SEL sh = NSSelectorFromString(@"sharedInstance");
+        if ([ctxCls respondsToSelector:sh]) {
+            @try {
+                id ctx = ((id (*)(id, SEL))objc_msgSend)((id)ctxCls, sh);
+                [out appendFormat:@"\nKuaishouRtcEngineContext.sharedInstance = %@\n",
+                 ctx ? NSStringFromClass(object_getClass(ctx)) : @"nil"];
+                if (ctx) {
+                    [out appendString:VCamDescribeObject(ctx)];
+                    if (!gKuaishouRtc) gKuaishouRtc = (__bridge void *)ctx; // 先记下来备用
+                }
+            } @catch (NSException *e) {
+                [out appendFormat:@"\nsharedInstance 调用异常: %@\n", e.reason];
+            }
+        }
+    }
+
+    return out;
+}
+
 // 装上快手侧的探针：只观察，不改变行为
 static void VCamInstallKuaishouHooks(void)
 {
