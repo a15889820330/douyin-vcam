@@ -7,7 +7,9 @@ on:
 
 jobs:
   build:
-    runs-on: macos-14
+    # 注意：不要用 macos-14 / macos-latest，它们可能被解析成 arm64 机型，
+    # 部分账号会报 "configuration 'macos-14-arm64-us-default' is not supported"
+    runs-on: macos-15-intel
     steps:
       - uses: actions/checkout@v4
 
@@ -17,9 +19,15 @@ jobs:
           echo "THEOS=$RUNNER_TEMP/theos" >> "$GITHUB_ENV"
           echo "$RUNNER_TEMP/theos/bin" >> "$GITHUB_PATH"
 
-      - name: 安装 iOS SDK
+      - name: 安装 iOS SDK（只取需要的那个，避免拉整个仓库）
         run: |
-          git clone --depth=1 https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          git clone --depth=1 --filter=blob:none --sparse https://github.com/theos/sdks.git "$RUNNER_TEMP/sdks"
+          cd "$RUNNER_TEMP/sdks"
+          git sparse-checkout set iPhoneOS16.5.sdk || true
+          if [ ! -d "$RUNNER_TEMP/sdks/iPhoneOS16.5.sdk" ]; then
+            echo "没取到 16.5，改为全部拉取"
+            git sparse-checkout disable
+          fi
           SDK=$(ls "$RUNNER_TEMP/sdks" | grep '^iPhoneOS' | sort -V | tail -1)
           echo "使用 SDK: $SDK"
           cp -R "$RUNNER_TEMP/sdks/$SDK" "$THEOS/sdks/"
