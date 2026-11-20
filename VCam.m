@@ -1,4 +1,4 @@
-// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -912,6 +912,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (BOOL)micMuteEnabled;
 - (void)setMicMuteEnabled:(BOOL)enabled;
 - (void)applyMicMute;
+- (BOOL)targetAvailable;
 @property (atomic, copy) NSString *muteMode;
 - (void)enablePushStreamIfNeeded;
 - (NSUInteger)pushedChunks;
@@ -1017,6 +1018,11 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
     }
 
     NSLog(@"[vcam] 麦克风静音 %@（%@ %@）", shouldMute ? @"开" : @"关", how, ok ? @"成功" : @"无可用接口");
+}
+
+- (BOOL)targetAvailable
+{
+    return gLiveAudioCapture != NULL;
 }
 
 - (NSUInteger)pushedChunks { return _chunks; }
@@ -1628,9 +1634,14 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
         _statusText.text = why.length ? [NSString stringWithFormat:@"未连接 · %@", why] : @"未连接";
     }
     VCamAudio *audio = [VCamAudio shared];
-    NSString *audioDesc = audio.isEnabled
-        ? [NSString stringWithFormat:@"%lu 块", (unsigned long)audio.pushedChunks]
-        : @"关";
+    NSString *audioDesc;
+    if (!audio.isEnabled) {
+        audioDesc = @"关";
+    } else if (!audio.targetAvailable) {
+        audioDesc = @"未适配本App";
+    } else {
+        audioDesc = [NSString stringWithFormat:@"%lu 块", (unsigned long)audio.pushedChunks];
+    }
     NSString *muteDesc = @"";
     if (audio.isEnabled && audio.micMuteEnabled) {
         muteDesc = [NSString stringWithFormat:@" · 静音:%@", audio.muteMode ?: @"未知"];
