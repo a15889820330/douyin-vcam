@@ -2403,6 +2403,13 @@ static int gRenderFills = 0;
 // 只改「确实指向 symbol 真实地址」的槽位
 static int VCamRebindSymbol(const char *symbol, void *replacement, void **original)
 {
+    // 插件加载时机很早，AudioToolbox 可能还没被加载，先主动 dlopen
+    static BOOL audioToolboxLoaded = NO;
+    if (!audioToolboxLoaded) {
+        audioToolboxLoaded = YES;
+        dlopen("/System/Library/Frameworks/AudioToolbox.framework/AudioToolbox", RTLD_LAZY | RTLD_GLOBAL);
+    }
+
     void *real = dlsym(RTLD_DEFAULT, symbol);
     if (!real) return 0;
 
@@ -2479,11 +2486,13 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                     if (!name) continue;
                     if (name[0] != '_' || strcmp(name + 1, symbol) != 0) continue;
 
-                    // 关键安全检查：只有当前值确实等于真实地址才替换
-                    if (slots[k] != real) continue;
+                    // 名字匹配即替换：延迟绑定的槽位此时可能还是桩函数，
+                    // 原实现统一用 dlsym 拿到的真实地址
                     if (original) *original = real;
-                    slots[k] = replacement;
-                    patched += 1;
+                    if (slots[k] != replacement) {
+                        slots[k] = replacement;
+                        patched += 1;
+                    }
                 }
             }
             cmd = (const struct load_command *)((const uint8_t *)cmd + cmd->cmdsize);
@@ -2689,6 +2698,18 @@ static void VCamInstallAudioUnitHook(void)
     gOrigAudioUnitUninitialize = (OSStatus (*)(AudioUnit))origUninit;
     VCamTrace(@"A4 AudioUnitUninitialize 重绑定 %d 处", n3);
     VCamTrace(@"A5 底层拦截安装完成");
+
+    // 延迟绑定的槽位会在首次调用时被 dyld 覆盖，所以过几秒再补一次
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(3 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        void *o = NULL;
+        int n = VCamRebindSymbol("AudioUnitRender", (void *)VCamAudioUnitRender, &o);
+        if (!gOrigAudioUnitRender && o) {
+            gOrigAudioUnitRender = (OSStatus (*)(AudioUnit, UInt32, const AudioTimeStamp *,
+                                                 UInt32, UInt32, AudioBufferList *))o;
+        }
+        VCamLogLine([NSString stringWithFormat:@"A6 二次补绑 %d 处", n]);
+    });
 
     // 15 秒后仍存活，说明这次没崩，清掉标记
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(15 * NSEC_PER_SEC)),
