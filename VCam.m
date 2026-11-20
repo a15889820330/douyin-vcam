@@ -96,6 +96,8 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
 @property (atomic, assign) BOOL reportedLoaded;
 @property (atomic, copy) NSString *diagReason;
 @property (atomic, copy) NSString *lastReason;
+@property (atomic, assign) int currentFD;
+- (void)restart;
 + (instancetype)shared;
 - (void)start;
 - (void)stop;
@@ -135,6 +137,19 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
     self.running = NO;
 }
 
+// 切换电脑 IP 后立即重连：先掐断当前 socket，再重启接收线程
+- (void)restart
+{
+    int fd = self.currentFD;
+    if (fd > 0) shutdown(fd, SHUT_RDWR);
+    self.running = NO;
+    __weak typeof(self) weakSelf = self;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.6 * NSEC_PER_SEC)),
+                   dispatch_get_main_queue(), ^{
+        [weakSelf start];
+    });
+}
+
 - (void)connectLoop
 {
     @autoreleasepool {
@@ -163,6 +178,7 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
             addr.sin_addr.s_addr = inet_addr([host UTF8String]);
 
             if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+                self.currentFD = fd;
                 if (!reportedConnect) {
                     reportedConnect = YES;
                     reportedFail = NO;
@@ -195,6 +211,7 @@ static BOOL VCamReadFull(int fd, void *buf, size_t len)
                               YES);
             }
 
+            self.currentFD = -1;
             close(fd);
             if (self.running) [NSThread sleepForTimeInterval:2.0];
         }
@@ -457,6 +474,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UILabel *_statusDot;
     UILabel *_statusText;
     UILabel *_footer;
+    UITextField *_hostField;
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
     UISegmentedControl *_fitSegment;
@@ -550,7 +568,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 208;
+    CGFloat w = 236, h = 260;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -604,7 +622,35 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_fitSegment addTarget:self action:@selector(fitChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_fitSegment];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 178, w - 32, 18) size:11 bold:NO];
+    // 电脑 IP（可手动修改）
+    [_card addSubview:[self makeLabel:@"电脑 IP" frame:CGRectMake(16, 178, 120, 20) size:12.5 bold:YES]];
+
+    _hostField = [[UITextField alloc] initWithFrame:CGRectMake(16, 198, 150, 30)];
+    _hostField.text = VCamHost();
+    _hostField.font = [UIFont monospacedDigitSystemFontOfSize:13 weight:UIFontWeightRegular];
+    _hostField.textColor = VCamInk();
+    _hostField.backgroundColor = [UIColor colorWithWhite:0 alpha:0.05];
+    _hostField.layer.cornerRadius = 8;
+    _hostField.borderStyle = UITextBorderStyleNone;
+    _hostField.keyboardType = UIKeyboardTypeNumbersAndPunctuation;
+    _hostField.returnKeyType = UIReturnKeyDone;
+    _hostField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _hostField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _hostField.leftView = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 8, 30)];
+    _hostField.leftViewMode = UITextFieldViewModeAlways;
+    [_card addSubview:_hostField];
+
+    UIButton *connectBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    connectBtn.frame = CGRectMake(172, 198, 48, 30);
+    connectBtn.backgroundColor = VCamAccent();
+    connectBtn.layer.cornerRadius = 8;
+    [connectBtn setTitle:@"连接" forState:UIControlStateNormal];
+    [connectBtn setTitleColor:VCamInk() forState:UIControlStateNormal];
+    connectBtn.titleLabel.font = [UIFont boldSystemFontOfSize:12.5];
+    [connectBtn addTarget:self action:@selector(connectTapped) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:connectBtn];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 236, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
@@ -652,6 +698,21 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 {
     [[NSUserDefaults standardUserDefaults] setBool:seg.selectedSegmentIndex == 1 forKey:@"vcam_fill"];
     [[NSUserDefaults standardUserDefaults] synchronize];
+}
+
+- (void)connectTapped
+{
+    NSString *ip = [_hostField.text stringByTrimmingCharactersInSet:
+                    [NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (ip.length == 0) {
+        _hostField.text = VCamHost();
+        return;
+    }
+    [[NSUserDefaults standardUserDefaults] setObject:ip forKey:@"vcam_host"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [_hostField resignFirstResponder];
+    [[VCamClient shared] restart];
+    NSLog(@"[vcam] 电脑 IP 改为 %@，正在重连", ip);
 }
 
 - (void)refreshStatus
