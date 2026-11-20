@@ -38,6 +38,13 @@ static const BOOL kShowAlerts = NO;
 // 是否显示逐帧诊断（排查 hook 时临时打开）
 static const BOOL kShowDiag = NO;
 
+// 电脑 PCM 缓冲：网络线程写，音频实时线程读（纯 C，不涉及 Objective-C）
+#define VCAM_PCM_MAX_FRAMES 48000
+static int16_t gPCM[VCAM_PCM_MAX_FRAMES * 2];
+static volatile int gPCMFrames = 0;
+static volatile double gPCMReadPos = 0.0;
+static volatile int gInjectEnabled = 0;
+
 static NSString *VCamHost(void)
 {
     NSString *host = [[NSUserDefaults standardUserDefaults] stringForKey:@"vcam_host"];
@@ -2235,11 +2242,6 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 static const BOOL kEnableAudioUnitHook = YES;
 
 // —— PCM 交换缓冲：网络线程写，音频线程读，纯 C 数据，不做任何 Objective-C 操作 ——
-#define VCAM_PCM_MAX_FRAMES 48000
-static int16_t gPCM[VCAM_PCM_MAX_FRAMES * 2];
-static volatile int gPCMFrames = 0;
-static volatile double gPCMReadPos = 0.0;
-static volatile int gInjectEnabled = 0;
 
 // —— 每个 AudioUnit 的缓存（在 AudioUnitInitialize 时填好）——
 typedef struct {
