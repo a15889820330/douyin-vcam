@@ -16,6 +16,7 @@
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
 #import <objc/message.h>
+#import <string.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
@@ -1455,6 +1456,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 {
     [[NSUserDefaults standardUserDefaults] setBool:enabled forKey:@"vcam_audio"];
     [[NSUserDefaults standardUserDefaults] synchronize];
+    gInjectEnabled = enabled ? 1 : 0;
     NSLog(@"[vcam] 声音内录 -> %@", enabled ? @"开" : @"关");
     [self applyMicMute];
 }
@@ -1632,6 +1634,15 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (void)pushAudio:(NSData *)pcm
 {
     self.latestPCM = pcm;
+
+    // 同步一份到纯 C 缓冲，供音频实时线程使用（那边不能碰 Objective-C）
+    NSUInteger frames = pcm.length / 4;   // 16bit 立体声
+    if (frames > VCAM_PCM_MAX_FRAMES) frames = VCAM_PCM_MAX_FRAMES;
+    if (frames > 1) {
+        memcpy(gPCM, pcm.bytes, frames * 4);
+        gPCMReadPos = 0.0;
+        gPCMFrames = (int)frames;
+    }
 
     if (![self isEnabled]) return;
 
@@ -2201,10 +2212,14 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 @end
 
-// ======================= 底层音频拦截（AudioUnitRender） =======================
+﻿// ======================= 底层音频拦截（AudioUnitRender） =======================
 //
-// 思路：iOS 上所有麦克风数据最终都要经过 AudioUnitRender 这个 C 函数。
-// 用符号重绑定把 App 对它的调用转到我们自己的实现里，渲染完再把缓冲区内容换成电脑音频。
+// 稳定要点：
+//   1. 重绑定只改「当前值确实等于真实 AudioUnitRender 地址」的槽位（用 dlsym 校验）
+//      否则跳过，绝不覆盖无关指针
+//   2. 实时线程里不调用任何 ObjC、不查属性、不加锁
+//   3. 单元格式在 AudioUnitInitialize 时（普通线程）预先查好并缓存
+//   4. 任何不认识的格式一律放行原始数据，宁可没效果也不崩
 
 #import <mach-o/dyld.h>
 #import <mach-o/loader.h>
@@ -2213,20 +2228,54 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 #import <mach/vm_map.h>
 #import <mach/mach.h>
 #import <AudioToolbox/AudioToolbox.h>
+#import <dlfcn.h>
 #import <math.h>
 #import <string.h>
 
-// 底层拦截总开关：默认关闭，稳定优先
-static const BOOL kEnableAudioUnitHook = NO;
+static const BOOL kEnableAudioUnitHook = YES;
 
+// —— PCM 交换缓冲：网络线程写，音频线程读，纯 C 数据，不做任何 Objective-C 操作 ——
+#define VCAM_PCM_MAX_FRAMES 48000
+static int16_t gPCM[VCAM_PCM_MAX_FRAMES * 2];
+static volatile int gPCMFrames = 0;
+static volatile double gPCMReadPos = 0.0;
+static volatile int gInjectEnabled = 0;
+
+// —— 每个 AudioUnit 的缓存（在 AudioUnitInitialize 时填好）——
+typedef struct {
+    AudioUnit unit;
+    int valid;
+    int isInput;
+    int isFloat;
+    int bits;
+    int channels;
+    double ratio;
+} VCamUnitInfo;
+
+static VCamUnitInfo gUnits[8];
+static OSStatus (*gOrigAudioUnitRender)(AudioUnit, UInt32, const AudioTimeStamp *,
+                                        UInt32, UInt32, AudioBufferList *) = NULL;
+static int gRenderCalls = 0;
+static int gRenderFills = 0;
+
+// 只改「确实指向 symbol 真实地址」的槽位
 static int VCamRebindSymbol(const char *symbol, void *replacement, void **original)
 {
+    void *real = dlsym(RTLD_DEFAULT, symbol);
+    if (!real) return 0;
+
     int patched = 0;
     uint32_t imageCount = _dyld_image_count();
 
     for (uint32_t i = 0; i < imageCount; i++) {
         const struct mach_header *header = _dyld_get_image_header(i);
         if (!header || header->magic != MH_MAGIC_64) continue;
+
+        const char *imageName = _dyld_get_image_name(i);
+        if (imageName && (strncmp(imageName, "/System/", 8) == 0 ||
+                          strncmp(imageName, "/usr/lib/", 9) == 0)) {
+            continue; // 系统库内部调用不走 GOT，跳过更安全
+        }
 
         const struct mach_header_64 *mh = (const struct mach_header_64 *)header;
         const struct symtab_command *symtabCmd = NULL;
@@ -2249,7 +2298,8 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
         if (!symtabCmd || !dysymCmd) continue;
 
         const char *strtab = (const char *)mh + symtabCmd->stroff;
-        const struct nlist_64 *symtab = (const struct nlist_64 *)((const uint8_t *)mh + symtabCmd->symoff);
+        const struct nlist_64 *symtab =
+            (const struct nlist_64 *)((const uint8_t *)mh + symtabCmd->symoff);
         const uint32_t *indirect =
             (const uint32_t *)((const uint8_t *)mh + dysymCmd->indirectsymoff);
 
@@ -2270,24 +2320,24 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
                 void **slots = (void **)((uint8_t *)mh + (section->addr - textVmaddr));
                 uint32_t count = (uint32_t)(section->size / sizeof(void *));
 
-                // __DATA_CONST 默认只读，先放开写权限
                 vm_address_t page = (vm_address_t)slots & ~(vm_page_size - 1);
                 vm_size_t pageSize = section->size + ((vm_address_t)slots - page);
-                vm_protect(mach_task_self(), page, pageSize, false,
-                           VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                kern_return_t kr = vm_protect(mach_task_self(), page, pageSize, false,
+                                              VM_PROT_READ | VM_PROT_WRITE | VM_PROT_COPY);
+                if (kr != KERN_SUCCESS) continue; // 改不了就不碰，避免写只读页崩溃
 
                 for (uint32_t k = 0; k < count; k++) {
                     uint32_t symIndex = indirect[section->reserved1 + k];
                     if (symIndex == INDIRECT_SYMBOL_LOCAL || symIndex == INDIRECT_SYMBOL_ABS) continue;
                     const char *name = strtab + symtab[symIndex].n_un.n_strx;
                     if (!name) continue;
-                    if (name[0] == '_' && strcmp(name + 1, symbol) == 0) {
-                        if (original) *original = slots[k];
-                        if (slots[k] != replacement) {
-                            slots[k] = replacement;
-                            patched += 1;
-                        }
-                    }
+                    if (name[0] != '_' || strcmp(name + 1, symbol) != 0) continue;
+
+                    // 关键安全检查：只有当前值确实等于真实地址才替换
+                    if (slots[k] != real) continue;
+                    if (original) *original = real;
+                    slots[k] = replacement;
+                    patched += 1;
                 }
             }
             cmd = (const struct load_command *)((const uint8_t *)cmd + cmd->cmdsize);
@@ -2296,104 +2346,102 @@ static int VCamRebindSymbol(const char *symbol, void *replacement, void **origin
     return patched;
 }
 
-// 每个 AudioUnit 的缓存：格式、是否输入、重采样相位
-typedef struct {
-    AudioUnit unit;
-    AudioStreamBasicDescription fmt;
-    int checked;
-    int isInput;
-    double phase;
-} VCamUnitCache;
-
-static VCamUnitCache gUnitCache[8];
-static OSStatus (*gOrigAudioUnitRender)(AudioUnit, UInt32, const AudioTimeStamp *,
-                                        UInt32, UInt32, AudioBufferList *) = NULL;
-static int gRenderCalls = 0;
-static int gRenderFills = 0;
-static int gRenderSkipped = 0;
-
-static VCamUnitCache *VCamCacheForUnit(AudioUnit unit)
+static VCamUnitInfo *VCamInfoForUnit(AudioUnit unit, int create)
 {
     for (int i = 0; i < 8; i++) {
-        if (gUnitCache[i].unit == unit) return &gUnitCache[i];
+        if (gUnits[i].valid && gUnits[i].unit == unit) return &gUnits[i];
     }
+    if (!create) return NULL;
     for (int i = 0; i < 8; i++) {
-        if (gUnitCache[i].unit == NULL) {
-            memset(&gUnitCache[i], 0, sizeof(VCamUnitCache));
-            gUnitCache[i].unit = unit;
-            return &gUnitCache[i];
+        if (!gUnits[i].valid) {
+            memset(&gUnits[i], 0, sizeof(VCamUnitInfo));
+            gUnits[i].unit = unit;
+            return &gUnits[i];
         }
     }
-    return &gUnitCache[0];
+    return NULL;
 }
 
-// 检查这个 unit 是不是「麦克风输入」
-static void VCamProbeUnit(VCamUnitCache *cache)
+// 在 AudioUnitInitialize 之后调用（普通线程，安全）
+static void VCamRecordUnitFormat(AudioUnit unit)
 {
-    cache->checked = 1;
-    cache->isInput = 0;
+    VCamUnitInfo *info = VCamInfoForUnit(unit, 1);
+    if (!info) return;
 
     UInt32 enableIO = 0;
     UInt32 size = sizeof(enableIO);
-    OSStatus st = AudioUnitGetProperty(cache->unit, kAudioOutputUnitProperty_EnableIO,
-                                      kAudioUnitScope_Input, 1, &enableIO, &size);
-    if (st == noErr && enableIO != 0) {
-        cache->isInput = 1;
+    OSStatus st = AudioUnitGetProperty(unit, kAudioOutputUnitProperty_EnableIO,
+                                       kAudioUnitScope_Input, 1, &enableIO, &size);
+    info->isInput = (st == noErr && enableIO != 0);
+
+    AudioStreamBasicDescription fmt;
+    memset(&fmt, 0, sizeof(fmt));
+    size = sizeof(fmt);
+    if (AudioUnitGetProperty(unit, kAudioUnitProperty_StreamFormat,
+                             kAudioUnitScope_Output, 1, &fmt, &size) != noErr) {
+        info->valid = 0;
+        return;
     }
 
-    size = sizeof(AudioStreamBasicDescription);
-    if (AudioUnitGetProperty(cache->unit, kAudioUnitProperty_StreamFormat,
-                             kAudioUnitScope_Output, 1, &cache->fmt, &size) != noErr) {
-        cache->isInput = 0;
-    }
+    info->isFloat = (fmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
+    info->bits = (int)fmt.mBitsPerChannel;
+    info->channels = (int)fmt.mChannelsPerFrame;
+    info->ratio = fmt.mSampleRate > 0 ? fmt.mSampleRate / 48000.0 : 1.0;
+    info->valid = 1;
+
+    VCamTrace(@"AudioUnit 记录: 输入=%@ %.0fHz %d 通道 %@",
+              info->isInput ? @"是" : @"否",
+              fmt.mSampleRate, info->channels, info->isFloat ? @"float" : @"int");
 }
 
-// 把电脑 PCM（s16 立体声 48k）填进 AudioBufferList
-static void VCamFillBuffers(AudioBufferList *ioData, UInt32 frames, VCamUnitCache *cache)
+// 实时线程：只用缓存 + 纯 C 内存，不加锁、不调 ObjC
+static void VCamFillFromPCM(AudioBufferList *ioData, UInt32 frames, VCamUnitInfo *info)
 {
-    NSData *pcm = [[VCamAudio shared] latestPCM];
-    if (!pcm.length) return;
+    int pcmFrames = gPCMFrames;
+    if (pcmFrames < 2 || !ioData) return;
 
-    double ratio = cache->fmt.mSampleRate > 0 ? cache->fmt.mSampleRate / 48000.0 : 1.0;
-    const int16_t *src = (const int16_t *)pcm.bytes;
-    size_t srcFrames = pcm.length / 4; // 立体声 16bit
-    if (srcFrames < 2) return;
-
-    int isFloat = (cache->fmt.mFormatFlags & kAudioFormatFlagIsFloat) != 0;
-    int is16 = (cache->fmt.mBitsPerChannel == 16);
+    int channels = info->channels > 0 ? info->channels : 1;
+    double ratio = info->ratio > 0 ? info->ratio : 1.0;
+    int isFloat = info->isFloat;
+    int is16 = (info->bits == 16) && !isFloat;
+    if (!isFloat && !is16) return; // 不认识的格式不动
 
     for (UInt32 b = 0; b < ioData->mNumberBuffers; b++) {
         AudioBuffer *buf = &ioData->mBuffers[b];
         if (!buf->mData) continue;
 
-        uint32_t channels = buf->mNumberChannels ? buf->mNumberChannels : 2;
-        size_t availFrames = buf->mDataByteSize / (channels * (isFloat ? 4 : 2));
+        UInt32 bufChannels = buf->mNumberChannels ? buf->mNumberChannels : (UInt32)channels;
+        size_t sampleBytes = isFloat ? 4 : 2;
+        size_t availFrames = buf->mDataByteSize / (bufChannels * sampleBytes);
         UInt32 n = frames < availFrames ? frames : (UInt32)availFrames;
 
+        double pos = gPCMReadPos;
         for (UInt32 i = 0; i < n; i++) {
-            double pos = cache->phase + i * ratio;
-            size_t idx = (size_t)pos % srcFrames;
-            int16_t left = src[idx * 2];
-            int16_t right = src[idx * 2 + 1];
+            int idx = (int)pos % pcmFrames;
+            int16_t left = gPCM[idx * 2];
+            int16_t right = gPCM[idx * 2 + 1];
 
             if (isFloat) {
                 float *dst = (float *)buf->mData;
-                dst[i * channels + 0] = left / 32768.0f;
-                if (channels > 1) dst[i * channels + 1] = right / 32768.0f;
-                for (uint32_t c = 2; c < channels; c++) dst[i * channels + c] = 0.0f;
-            } else if (is16) {
-                int16_t *dst = (int16_t *)buf->mData;
-                dst[i * channels + 0] = left;
-                if (channels > 1) dst[i * channels + 1] = right;
-                for (uint32_t c = 2; c < channels; c++) dst[i * channels + c] = 0;
+                dst[i * bufChannels + 0] = left / 32768.0f;
+                if (bufChannels > 1) dst[i * bufChannels + 1] = right / 32768.0f;
+                for (UInt32 c = 2; c < bufChannels; c++) dst[i * bufChannels + c] = 0.0f;
             } else {
-                return; // 不认识的格式，不动它
+                int16_t *dst = (int16_t *)buf->mData;
+                dst[i * bufChannels + 0] = left;
+                if (bufChannels > 1) dst[i * bufChannels + 1] = right;
+                for (UInt32 c = 2; c < bufChannels; c++) dst[i * bufChannels + c] = 0;
             }
+            pos += ratio;
+            if (pos >= pcmFrames) pos -= pcmFrames;
         }
-        buf->mDataByteSize = n * channels * (isFloat ? 4 : 2);
-        cache->phase = fmod(cache->phase + n * ratio, (double)srcFrames);
+        gPCMReadPos = pos;
+        buf->mDataByteSize = (UInt32)(n * bufChannels * sampleBytes);
     }
 }
+
+static OSStatus (*gOrigAudioUnitInitialize)(AudioUnit) = NULL;
+static OSStatus (*gOrigAudioUnitUninitialize)(AudioUnit) = NULL;
 
 static OSStatus VCamAudioUnitRender(AudioUnit unit, UInt32 flags, const AudioTimeStamp *ts,
                                     UInt32 bus, UInt32 frames, AudioBufferList *ioData)
@@ -2404,32 +2452,37 @@ static OSStatus VCamAudioUnitRender(AudioUnit unit, UInt32 flags, const AudioTim
 
     gRenderCalls += 1;
 
-    VCamUnitCache *cache = VCamCacheForUnit(unit);
-    if (!cache->checked) VCamProbeUnit(cache);
+    if (!gInjectEnabled) return st;
+    if (bus != 1) return st;
 
-    // 只处理输入单元（麦克风），避免影响播放
-    if (!cache->isInput || bus != 1) return st;
+    VCamUnitInfo *info = VCamInfoForUnit(unit, 0);
+    if (!info || !info->isInput) return st;
 
-    if (![[VCamAudio shared] isEnabled]) {
-        gRenderSkipped += 1;
-        return st;
-    }
-
-    VCamFillBuffers(ioData, frames, cache);
+    VCamFillFromPCM(ioData, frames, info);
     gRenderFills += 1;
-    if (gRenderFills == 1) {
-        NSLog(@"[vcam] 已开始用电脑音频替换麦克风数据（%.0fHz %u 通道 %s）",
-              cache->fmt.mSampleRate, cache->fmt.mChannelsPerFrame,
-              (cache->fmt.mFormatFlags & kAudioFormatFlagIsFloat) ? "float" : "int");
-    }
     return st;
+}
+
+static OSStatus VCamAudioUnitInitialize(AudioUnit unit)
+{
+    if (!gOrigAudioUnitInitialize) return -1;
+    OSStatus st = gOrigAudioUnitInitialize(unit);
+    if (st == noErr) VCamRecordUnitFormat(unit);   // 普通线程，安全
+    return st;
+}
+
+static OSStatus VCamAudioUnitUninitialize(AudioUnit unit)
+{
+    if (!gOrigAudioUnitUninitialize) return -1;
+    VCamUnitInfo *info = VCamInfoForUnit(unit, 0);
+    if (info) info->valid = 0;
+    return gOrigAudioUnitUninitialize(unit);
 }
 
 static void VCamInstallAudioUnitHook(void)
 {
     if (!kEnableAudioUnitHook) {
-        // 默认关闭：底层重绑定风险高（实时线程里查属性/读偏好会死锁或触发 watchdog）
-        VCamTrace(@"AudioUnitRender 拦截已禁用（稳定模式）");
+        VCamTrace(@"AudioUnitRender 拦截已禁用");
         return;
     }
 
@@ -2437,7 +2490,17 @@ static void VCamInstallAudioUnitHook(void)
     int n = VCamRebindSymbol("AudioUnitRender", (void *)VCamAudioUnitRender, &orig);
     gOrigAudioUnitRender = (OSStatus (*)(AudioUnit, UInt32, const AudioTimeStamp *,
                                          UInt32, UInt32, AudioBufferList *))orig;
-    VCamTrace(@"AudioUnitRender 重绑定: %d 处，原实现=%p", n, orig);
+    VCamTrace(@"AudioUnitRender 重绑定 %d 处", n);
+
+    void *origInit = NULL;
+    int n2 = VCamRebindSymbol("AudioUnitInitialize", (void *)VCamAudioUnitInitialize, &origInit);
+    gOrigAudioUnitInitialize = (OSStatus (*)(AudioUnit))origInit;
+    VCamTrace(@"AudioUnitInitialize 重绑定 %d 处", n2);
+
+    void *origUninit = NULL;
+    int n3 = VCamRebindSymbol("AudioUnitUninitialize", (void *)VCamAudioUnitUninitialize, &origUninit);
+    gOrigAudioUnitUninitialize = (OSStatus (*)(AudioUnit))origUninit;
+    VCamTrace(@"AudioUnitUninitialize 重绑定 %d 处", n3);
 }
 
 // ======================= Hook =======================
@@ -2549,6 +2612,7 @@ static void VCamInit(void)
                        dispatch_get_main_queue(), ^{
             [[VCamClient shared] start];
             [[VCamAudio shared] start];
+            gInjectEnabled = [[VCamAudio shared] isEnabled] ? 1 : 0;
             [[VCamOverlay shared] install];
         });
     }
