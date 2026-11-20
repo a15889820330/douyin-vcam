@@ -33,7 +33,22 @@ jobs:
           cp -R "$RUNNER_TEMP/sdks/$SDK" "$THEOS/sdks/"
 
       - name: 编译
-        run: make -j4
+        run: |
+          set +e
+          make -j4 > build.log 2>&1
+          code=$?
+          if [ $code -ne 0 ]; then
+            echo "===== 编译失败，关键错误行如下 ====="
+            # 把错误行写成注解：注解是公开可读的，方便外部排查
+            grep -n -E "error:|Error:|fatal error|undefined symbol|No such file|not found|error" build.log \
+              | grep -v -E "^\s*$" | head -25 | while IFS= read -r line; do
+                echo "::error::$line"
+              done
+            echo "===== 最后 40 行 ====="
+            tail -40 build.log
+            exit $code
+          fi
+          tail -20 build.log
 
       - name: 收集产物
         run: |
