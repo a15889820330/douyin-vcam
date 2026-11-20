@@ -1,4 +1,4 @@
-﻿// 抖音虚拟摄像头注入（TrollStore / TrollFools）
+// 抖音虚拟摄像头注入（TrollStore / TrollFools）
 //
 // 关键约束与取舍：
 //   1. TrollStore 注入的 dylib 没有 Substrate，所以不用 Logos 的 %hook，
@@ -761,6 +761,8 @@ static NSString *VCamFindImplementors(void)
     return out;
 }
 
+static NSString *VCamKuaishouReport(void);
+
 static NSString *VCamAudioReport(void)
 {
     NSMutableString *out = [NSMutableString string];
@@ -845,11 +847,161 @@ static NSString *VCamAudioReport(void)
 
     [out appendString:VCamScanAudioAPIs()];
     [out appendString:VCamFindImplementors()];
+    [out appendString:VCamKuaishouReport()];
 
     return out;
 }
 
-// ======================= 音频注入（把电脑声音推进抖音） =======================
+// ======================= 快手（RTC 引擎）探测 =======================
+
+static void *gKuaishouRtc = NULL;          // 捕获到的 RTC 引擎实例
+static NSString *gKuaishouFrameInfo = nil; // 捕获到的音频帧对象结构
+
+// 描述一个对象：类名 + 父类 + 属性 + 实例变量
+static NSString *VCamDescribeObject(id obj)
+{
+    if (!obj) return @"(nil)";
+    Class cls = object_getClass(obj);
+    NSMutableString *s = [NSMutableString stringWithFormat:@"类名: %s\n", class_getName(cls)];
+
+    Class sup = class_getSuperclass(cls);
+    if (sup) [s appendFormat:@"父类: %s\n", class_getName(sup)];
+
+    unsigned int pc = 0;
+    objc_property_t *props = class_copyPropertyList(cls, &pc);
+    [s appendFormat:@"属性 %u 个:\n", pc];
+    for (unsigned int i = 0; i < pc && i < 25; i++) {
+        [s appendFormat:@"  %s  (%s)\n", property_getName(props[i]),
+                      property_getAttributes(props[i]) ?: ""];
+    }
+    free(props);
+
+    unsigned int ic = 0;
+    Ivar *ivars = class_copyIvarList(cls, &ic);
+    [s appendFormat:@"实例变量 %u 个:\n", ic];
+    for (unsigned int i = 0; i < ic && i < 25; i++) {
+        [s appendFormat:@"  %s  (%s)\n", ivar_getName(ivars[i]),
+                      ivar_getTypeEncoding(ivars[i]) ?: ""];
+    }
+    free(ivars);
+
+    return s;
+}
+
+// 报告：快手 RTC 引擎的类方法 + 我们抓到了什么
+static NSString *VCamKuaishouReport(void)
+{
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 七、快手 RTC 引擎探测 ==\n"];
+
+    NSArray *names = @[
+        @"KuaishouRtcEngine", @"KuaishouRtcEngineShadow", @"KuaishouRtcEngineKmp",
+        @"KuaishouRtcEngineContext", @"KSKNSRtcEngineExt", @"KSKNSIRtcEngine",
+    ];
+
+    NSArray *keys = @[ @"shared", @"instance", @"default", @"create", @"engine", @"manager" ];
+
+    for (NSString *name in names) {
+        Class cls = objc_getClass([name UTF8String]);
+        if (!cls) {
+            [out appendFormat:@"\n%@ : 不存在\n", name];
+            continue;
+        }
+        [out appendFormat:@"\n%@ 的类方法（含关键词）:\n", name];
+        Class meta = object_getClass(cls);
+        unsigned int mc = 0;
+        Method *ms = class_copyMethodList(meta, &mc);
+        BOOL any = NO;
+        for (unsigned int i = 0; i < mc; i++) {
+            NSString *sel = NSStringFromSelector(method_getName(ms[i]));
+            for (NSString *key in keys) {
+                if ([sel rangeOfString:key options:NSCaseInsensitiveSearch].location != NSNotFound) {
+                    [out appendFormat:@"  +%@\n     %s\n", sel, method_getTypeEncoding(ms[i])];
+                    any = YES;
+                    break;
+                }
+            }
+        }
+        free(ms);
+        if (!any) [out appendString:@"  （没有匹配）\n"];
+    }
+
+    [out appendFormat:@"\n已捕获 RTC 引擎实例: %@\n", gKuaishouRtc ? @"是" : @"否"];
+    [out appendFormat:@"已捕获音频帧对象: %@\n", gKuaishouFrameInfo ? @"是" : @"否"];
+    if (gKuaishouFrameInfo) {
+        [out appendString:gKuaishouFrameInfo];
+    } else {
+        [out appendString:@"（进入直播画面并播放一下声音，再回来看这里）\n"];
+    }
+
+    return out;
+}
+
+// 装上快手侧的探针：只观察，不改变行为
+static void VCamInstallKuaishouHooks(void)
+{
+    Class engine = objc_getClass("KuaishouRtcEngine");
+    if (!engine) {
+        VCamTrace(@"快手 RTC 引擎不存在（当前不是快手进程）");
+        return;
+    }
+
+    // 抓引擎实例 + 音频帧对象长什么样
+    SEL sel = @selector(inputSpeakerAudioFrame:);
+    Method m = class_getInstanceMethod(engine, sel);
+    if (m) {
+        IMP orig = method_getImplementation(m);
+        IMP repl = imp_implementationWithBlock(^int(id obj, id frame) {
+            gKuaishouRtc = (__bridge void *)obj;
+            if (!gKuaishouFrameInfo) {
+                gKuaishouFrameInfo = [VCamDescribeObject(frame) copy];
+                VCamTrace(@"抓到快手音频帧对象: %@", [gKuaishouFrameInfo componentsSeparatedByString:@"\n"].firstObject);
+            }
+            return ((int (*)(id, SEL, id))orig)(obj, sel, frame);
+        });
+        class_replaceMethod(engine, sel, repl, method_getTypeEncoding(m));
+        VCamTrace(@"已 hook KuaishouRtcEngine inputSpeakerAudioFrame:");
+    }
+
+    // 内录开关被调用时也能抓到实例
+    SEL recSel = @selector(enableAudioInternalRecording);
+    Method recM = class_getInstanceMethod(engine, recSel);
+    if (recM) {
+        IMP recOrig = method_getImplementation(recM);
+        IMP recRepl = imp_implementationWithBlock(^(id obj) {
+            gKuaishouRtc = (__bridge void *)obj;
+            VCamTrace(@"快手开启内录，已记录 RTC 引擎实例");
+            ((void (*)(id, SEL))recOrig)(obj, recSel);
+        });
+        class_replaceMethod(engine, recSel, recRepl, method_getTypeEncoding(recM));
+    }
+
+    // 快手往直播流混音频时一定会走这里——能同时拿到引擎实例和音频帧对象模板
+    Class ext = objc_getClass("KSKNSRtcEngineExt");
+    if (ext) {
+        SEL mixSel = NSSelectorFromString(@"inputAudioMultiTrackDataChannelId:audioFrameArray:needPlay:needMixRtc:needMixLiveStream:timestamp:");
+        Method mixM = class_getInstanceMethod(ext, mixSel);
+        if (mixM) {
+            IMP mixOrig = method_getImplementation(mixM);
+            IMP mixRepl = imp_implementationWithBlock(^int(id obj, id channelId, id frames,
+                                                           char needPlay, char needMixRtc,
+                                                           char needMixLiveStream, long long ts) {
+                gKuaishouRtc = (__bridge void *)obj;
+                if (!gKuaishouFrameInfo) {
+                    id first = [frames isKindOfClass:[NSArray class]] ? [frames firstObject] : frames;
+                    if (first) {
+                        gKuaishouFrameInfo = [VCamDescribeObject(first) copy];
+                        VCamTrace(@"抓到快手混音调用，帧对象已记录");
+                    }
+                }
+                return ((int (*)(id, SEL, id, id, char, char, char, long long))mixOrig)(
+                    obj, mixSel, channelId, frames, needPlay, needMixRtc, needMixLiveStream, ts);
+            });
+            class_replaceMethod(ext, mixSel, mixRepl, method_getTypeEncoding(mixM));
+            VCamTrace(@"已 hook 快手 inputAudioMultiTrack...（混音入口）");
+        }
+    }
+}
 
 // 抖音直播的音频采集对象（LiveStreamAudioCapture），在 startAudioCapture 时记下来
 static void *gLiveAudioCapture = NULL;
@@ -1193,6 +1345,8 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 }
 
 @end
+
+// ======================= 音频注入（抖音：LiveStreamAudioCapture） =======================
 
 static void VCamInstallAudioHooks(void)
 {
@@ -1812,6 +1966,7 @@ static void VCamInit(void)
         VCamInstallHooks();
         VCamInstallAudioProbes();
         VCamInstallAudioHooks();
+        VCamInstallKuaishouHooks();
 
         // 加载后 2 秒：开始收帧 + 弹出控制面板
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
