@@ -308,6 +308,18 @@ static void VCamReportDiag(NSString *key, NSString *reason, NSData *jpeg, NSTime
         return NO;
     }
 
+    // 面板上的 ↺ / ↻ 旋转（每按一次 90°）
+    NSInteger rotation = [[NSUserDefaults standardUserDefaults] integerForKey:@"vcam_rotation"];
+    rotation = ((rotation % 360) + 360) % 360;
+    if (rotation != 0) {
+        CGAffineTransform rot = CGAffineTransformMakeRotation((CGFloat)rotation * (CGFloat)M_PI / 180.0);
+        CIImage *rotated = [ciImage imageByApplyingTransform:rot];
+        CGRect re = rotated.extent;
+        // 旋转后原点可能变成负数，平移回 (0,0)
+        rotated = [rotated imageByApplyingTransform:CGAffineTransformMakeTranslation(-re.origin.x, -re.origin.y)];
+        ciImage = rotated;
+    }
+
     // 等比缩放居中（contain）
     CGFloat srcW = ciImage.extent.size.width;
     CGFloat srcH = ciImage.extent.size.height;
@@ -1071,6 +1083,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UILabel *_statusDot;
     UILabel *_statusText;
     UILabel *_footer;
+    UILabel *_rotationLabel;
     UITextField *_hostField;
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
@@ -1167,7 +1180,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 372;
+    CGFloat w = 236, h = 410;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -1250,27 +1263,55 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_card addSubview:connectBtn];
 
     // 声音内录
-    [_card addSubview:[self makeLabel:@"声音内录" frame:CGRectMake(16, 236, 120, 24) size:13.5 bold:YES]];
-    _audioSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 232, 52, 32)];
+    // 画面旋转（每次 90°）
+    [_card addSubview:[self makeLabel:@"画面旋转" frame:CGRectMake(16, 232, 84, 24) size:13.5 bold:YES]];
+
+    UIButton *rotL = [UIButton buttonWithType:UIButtonTypeSystem];
+    rotL.frame = CGRectMake(104, 232, 56, 26);
+    rotL.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
+    rotL.layer.cornerRadius = 7;
+    [rotL setTitle:@"↺ 90°" forState:UIControlStateNormal];
+    [rotL setTitleColor:VCamInk() forState:UIControlStateNormal];
+    rotL.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [rotL addTarget:self action:@selector(rotateLeft) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:rotL];
+
+    UIButton *rotR = [UIButton buttonWithType:UIButtonTypeSystem];
+    rotR.frame = CGRectMake(164, 232, 56, 26);
+    rotR.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
+    rotR.layer.cornerRadius = 7;
+    [rotR setTitle:@"↻ 90°" forState:UIControlStateNormal];
+    [rotR setTitleColor:VCamInk() forState:UIControlStateNormal];
+    rotR.titleLabel.font = [UIFont boldSystemFontOfSize:12];
+    [rotR addTarget:self action:@selector(rotateRight) forControlEvents:UIControlEventTouchUpInside];
+    [_card addSubview:rotR];
+
+    _rotationLabel = [self makeLabel:@"" frame:CGRectMake(16, 258, 120, 16) size:11 bold:NO];
+    _rotationLabel.textColor = VCamMuted();
+    [_card addSubview:_rotationLabel];
+    [self updateRotationLabel];
+
+    [_card addSubview:[self makeLabel:@"声音内录" frame:CGRectMake(16, 280, 120, 24) size:13.5 bold:YES]];
+    _audioSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 276, 52, 32)];
     _audioSwitch.onTintColor = VCamAccent();
     _audioSwitch.on = [[VCamAudio shared] isEnabled];
     [_audioSwitch addTarget:self action:@selector(audioChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_audioSwitch];
 
     // 静音麦克风（内录时用电脑声音顶替麦克风）
-    [_card addSubview:[self makeLabel:@"静音麦克风" frame:CGRectMake(16, 266, 120, 24) size:13.5 bold:YES]];
-    _micMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 262, 52, 32)];
+    [_card addSubview:[self makeLabel:@"静音麦克风" frame:CGRectMake(16, 306, 120, 24) size:13.5 bold:YES]];
+    _micMuteSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 302, 52, 32)];
     _micMuteSwitch.onTintColor = VCamAccent();
     _micMuteSwitch.on = [[VCamAudio shared] micMuteEnabled];
     [_micMuteSwitch addTarget:self action:@selector(micMuteChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_micMuteSwitch];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 302, w - 32, 18) size:11 bold:NO];
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 342, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 326, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 366, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -1401,6 +1442,42 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 - (void)micMuteChanged:(UISwitch *)s
 {
     [[VCamAudio shared] setMicMuteEnabled:s.on];
+}
+
+#pragma mark - 画面旋转
+
+- (NSInteger)rotation
+{
+    NSInteger r = [[NSUserDefaults standardUserDefaults] integerForKey:@"vcam_rotation"];
+    return ((r % 360) + 360) % 360;
+}
+
+- (void)setRotation:(NSInteger)degrees
+{
+    NSInteger r = ((degrees % 360) + 360) % 360;
+    [[NSUserDefaults standardUserDefaults] setInteger:r forKey:@"vcam_rotation"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    [self updateRotationLabel];
+    NSLog(@"[vcam] 旋转 -> %ld°", (long)r);
+}
+
+- (void)rotateLeft
+{
+    [self setRotation:[self rotation] - 90];
+}
+
+- (void)rotateRight
+{
+    [self setRotation:[self rotation] + 90];
+}
+
+- (void)updateRotationLabel
+{
+    if (!_rotationLabel) return;
+    NSInteger r = [self rotation];
+    _rotationLabel.text = r == 0
+        ? @"当前 0°（未旋转）"
+        : [NSString stringWithFormat:@"当前 %ld°", (long)r];
 }
 
 - (void)refreshStatus
