@@ -1159,6 +1159,44 @@ static NSString *VCamKuaishouCaptureReport(void)
 
 static void VCamHookKuaishouCapture(void)
 {
+    // 从 KWDaenerysAudioController 反向摸到 capture session（快手的 live 走这条路）
+    Class ctrlCls = objc_getClass("KWDaenerysAudioController");
+    if (ctrlCls) {
+        SEL startSel = NSSelectorFromString(@"_startAudioSession");
+        Method startM = class_getInstanceMethod(ctrlCls, startSel);
+        if (startM) {
+            IMP startOrig = method_getImplementation(startM);
+            IMP startRepl = imp_implementationWithBlock(^(id obj) {
+                VCamTrace(@"快手音频控制器启动会话");
+                ((void (*)(id, SEL))startOrig)(obj, startSel);
+
+                // 尝试读出它持有的 capture session 和回调 block
+                @try {
+                    SEL sessSel = NSSelectorFromString(@"audioCaptureSession");
+                    if ([obj respondsToSelector:sessSel]) {
+                        id session = ((id (*)(id, SEL))objc_msgSend)(obj, sessSel);
+                        if (session) {
+                            gKwCapture = (__bridge void *)session;
+                            SEL blkSel = NSSelectorFromString(@"audioCaptureBlock");
+                            if ([session respondsToSelector:blkSel]) {
+                                id blk = ((id (*)(id, SEL))objc_msgSend)(session, blkSel);
+                                if (blk) {
+                                    gKwCaptureBlock = (__bridge void *)blk;
+                                    gKwCaptureInfo = [VCamDescribeCaptureSession() copy];
+                                    VCamTrace(@"从控制器读到快手采集回调");
+                                }
+                            }
+                        }
+                    }
+                } @catch (NSException *e) {
+                    VCamTrace(@"读取采集会话异常: %@", e.reason);
+                }
+            });
+            class_replaceMethod(ctrlCls, startSel, startRepl, method_getTypeEncoding(startM));
+            VCamTrace(@"已 hook KWDaenerysAudioController _startAudioSession");
+        }
+    }
+
     Class cls = objc_getClass("KWDAudioCaptureSession");
     if (!cls) return;
 
@@ -1383,6 +1421,8 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (void)applyMicMute;
 - (BOOL)targetAvailable;
 @property (atomic, copy) NSString *muteMode;
+@property (atomic, assign) float ksSavedVolume;
+@property (atomic, assign) BOOL ksVolumeSaved;
 - (void)enablePushStreamIfNeeded;
 - (NSUInteger)pushedChunks;
 @end
@@ -1446,6 +1486,39 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (void)applyMicMute
 {
     BOOL shouldMute = [self isEnabled] && [self micMuteEnabled];
+
+    // 快手：KuaishouRtcEngineContext 单例里的麦克风输入音量
+    Class ksCtxCls = objc_getClass("KuaishouRtcEngineContext");
+    if (ksCtxCls) {
+        SEL sharedSel = NSSelectorFromString(@"sharedInstance");
+        if ([ksCtxCls respondsToSelector:sharedSel]) {
+            @try {
+                id ctx = ((id (*)(id, SEL))objc_msgSend)((id)ksCtxCls, sharedSel);
+                if (ctx) {
+                    if (shouldMute) {
+                        if (!self.ksVolumeSaved) {
+                            float v = ((float (*)(id, SEL))objc_msgSend)(ctx, NSSelectorFromString(@"audioInputVolume"));
+                            self.ksSavedVolume = v;
+                            self.ksVolumeSaved = YES;
+                        }
+                        if (VCamCallNumber(ctx, @"setAudioInputVolume:", 0.0)) {
+                            self.muteMode = @"快手输入音量";
+                            NSLog(@"[vcam] 快手掌风静音（audioInputVolume=0）");
+                            return;
+                        }
+                    } else if (self.ksVolumeSaved) {
+                        VCamCallNumber(ctx, @"setAudioInputVolume:", self.ksSavedVolume);
+                        self.ksVolumeSaved = NO;
+                        self.muteMode = @"快手已恢复";
+                        NSLog(@"[vcam] 快手麦克风恢复（audioInputVolume=%.2f）", self.ksSavedVolume);
+                        return;
+                    }
+                }
+            } @catch (NSException *e) {
+                NSLog(@"[vcam] 快手音量设置异常: %@", e.reason);
+            }
+        }
+    }
 
     // 第 0 级（最精准）：设备级音量——只作用在物理麦克风上，不影响我们推送的音频
     id adm = VCamFindAudioDeviceModule((__bridge id)gLiveAudioCapture);
