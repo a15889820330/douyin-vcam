@@ -592,6 +592,24 @@ static NSString *VCamDumpClassMethods(NSString *className)
     return s;
 }
 
+// 打印指定 selector 的完整类型编码（决定调用时参数怎么传）
+static NSString *VCamDumpSignatures(NSString *className, NSArray *selectorNames)
+{
+    Class cls = objc_getClass([className UTF8String]);
+    if (!cls) return [NSString stringWithFormat:@"\n== %@ ==\n  （类不存在）\n", className];
+
+    NSMutableString *s = [NSMutableString stringWithFormat:@"\n== %@ 方法签名 ==\n", className];
+    for (NSString *name in selectorNames) {
+        if (![cls instancesRespondToSelector:NSSelectorFromString(name)]) {
+            [s appendFormat:@"  %@\n     （没有这个方法）\n", name];
+            continue;
+        }
+        Method m = class_getInstanceMethod(cls, NSSelectorFromString(name));
+        [s appendFormat:@"  %@\n     %s\n", name, m ? method_getTypeEncoding(m) : "(null)"];
+    }
+    return s;
+}
+
 static NSString *VCamAudioReport(void)
 {
     NSMutableString *out = [NSMutableString string];
@@ -657,6 +675,19 @@ static NSString *VCamAudioReport(void)
         [out appendFormat:@"\n（命中 %lu 个，已列出 %lu 个）\n",
          (unsigned long)names.count, (unsigned long)limit];
     }
+
+    [out appendString:@"\n== 四、音频注入候选方法的类型签名 ==\n"];
+    NSArray *pushSel = @[
+        @"pushAudioBuffer:andDataLen:sampleRate:channels:andBitsPerSample:timestamp:",
+        @"pushExternalAudioFrame:DataSize:FormatType:SampleRate:ChannelNumber:PTS:",
+        @"pushExternalSpecifiedAudioFrame:DataSize:FormatType:SampleRate:ChannelNumber:PTS:",
+        @"pushExternalEncodeAudioFrame:",
+        @"pushScreenAudioFrame:",
+        @"startAudioCapture",
+        @"stopAudioCapture",
+    ];
+    [out appendString:VCamDumpSignatures(@"LiveStreamAudioCapture", pushSel)];
+    [out appendString:VCamDumpSignatures(@"BAudioKitObjcAudioDeviceModule", pushSel)];
 
     return out;
 }
