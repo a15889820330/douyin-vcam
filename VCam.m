@@ -45,6 +45,53 @@ static volatile int gPCMFrames = 0;
 static volatile double gPCMReadPos = 0.0;
 static volatile int gInjectEnabled = 0;
 
+// ======================= 崩溃取证日志 =======================
+// 每行都落盘并 flush：App 崩溃后重启仍能读到最后一步，用来定位死在哪
+
+static NSString *VCamLogPath(void)
+{
+    NSString *dir = NSSearchPathForDirectoriesInDomains(NSCachesDirectory, NSUserDomainMask, YES).firstObject;
+    if (!dir) dir = NSTemporaryDirectory();
+    return [dir stringByAppendingPathComponent:@"vcam-trace.log"];
+}
+
+static void VCamLogLine(NSString *message)
+{
+    @autoreleasepool {
+        NSString *path = VCamLogPath();
+        NSString *line = [NSString stringWithFormat:@"%.3f  %@\n",
+                          [NSDate timeIntervalSinceReferenceDate], message];
+        NSData *data = [line dataUsingEncoding:NSUTF8StringEncoding];
+        NSFileHandle *fh = [NSFileHandle fileHandleForWritingAtPath:path];
+        if (!fh) {
+            [data writeToFile:path atomically:NO];
+            return;
+        }
+        @try {
+            [fh seekToEndOfFile];
+            [fh writeData:data];
+            [fh synchronizeFile];
+        } @catch (NSException *e) {
+            // 写日志失败不能影响主流程
+        }
+        [fh closeFile];
+    }
+}
+
+static NSString *VCamLogTail(NSUInteger lines)
+{
+    NSString *path = VCamLogPath();
+    NSString *all = [NSString stringWithContentsOfFile:path encoding:NSUTF8StringEncoding error:NULL];
+    if (!all.length) return @"（还没有日志）\n";
+    NSArray *arr = [all componentsSeparatedByString:@"\n"];
+    NSUInteger start = arr.count > lines ? arr.count - lines : 0;
+    NSMutableString *out = [NSMutableString string];
+    for (NSUInteger i = start; i < arr.count; i++) {
+        if ([arr[i] length]) [out appendFormat:@"%@\n", arr[i]];
+    }
+    return [out length] ? out : @"（日志为空）\n";
+}
+
 static NSString *VCamHost(void)
 {
     NSString *host = [[NSUserDefaults standardUserDefaults] stringForKey:@"vcam_host"];
@@ -509,6 +556,7 @@ static void VCamTrace(NSString *fmt, ...)
         if (gAudioTrace.count > 300) [gAudioTrace removeObjectAtIndex:0];
     }
     NSLog(@"[vcam-audio] %@", s);
+    VCamLogLine(s);
 }
 
 // 被动观察：不改变行为，只记录抖音的音频管线走了哪条路
@@ -772,6 +820,7 @@ static NSString *VCamFindImplementors(void)
 static NSString *VCamKuaishouReport(void);
 static NSString *VCamKuaishouDeepReport(void);
 static NSString *VCamKuaishouCaptureReport(void);
+static NSString *VCamRuntimeLogReport(void);
 
 static NSString *VCamAudioReport(void)
 {
@@ -860,6 +909,7 @@ static NSString *VCamAudioReport(void)
     [out appendString:VCamKuaishouReport()];
     [out appendString:VCamKuaishouDeepReport()];
     [out appendString:VCamKuaishouCaptureReport()];
+    [out appendString:VCamRuntimeLogReport()];
 
     return out;
 }
@@ -1793,6 +1843,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     UISwitch *_enableSwitch;
     UISwitch *_mirrorSwitch;
     UISwitch *_audioSwitch;
+    UISwitch *_auSwitch;
     UISwitch *_micMuteSwitch;
     UISegmentedControl *_fitSegment;
     NSTimer *_timer;
@@ -1885,7 +1936,7 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 
 - (void)buildCard
 {
-    CGFloat w = 236, h = 418;
+    CGFloat w = 236, h = 456;
     CGFloat x = _window.bounds.size.width - w - 14;
     CGFloat y = 120;
     _card = [[UIView alloc] initWithFrame:CGRectMake(x, y, w, h)];
@@ -2011,12 +2062,20 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
     [_micMuteSwitch addTarget:self action:@selector(micMuteChanged:) forControlEvents:UIControlEventValueChanged];
     [_card addSubview:_micMuteSwitch];
 
-    _footer = [self makeLabel:@"" frame:CGRectMake(16, 354, w - 32, 18) size:11 bold:NO];
+    // 底层实验开关（危险：开启后重启 App 才会生效）
+    [_card addSubview:[self makeLabel:@"底层实验" frame:CGRectMake(16, 356, 120, 24) size:13.5 bold:YES]];
+    _auSwitch = [[UISwitch alloc] initWithFrame:CGRectMake(w - 68, 352, 52, 32)];
+    _auSwitch.onTintColor = [UIColor colorWithRed:0.90 green:0.45 blue:0.35 alpha:1.0];
+    _auSwitch.on = [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"];
+    [_auSwitch addTarget:self action:@selector(auHookChanged:) forControlEvents:UIControlEventValueChanged];
+    [_card addSubview:_auSwitch];
+
+    _footer = [self makeLabel:@"" frame:CGRectMake(16, 392, w - 32, 18) size:11 bold:NO];
     _footer.textColor = VCamMuted();
     [_card addSubview:_footer];
 
     UIButton *audioBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-    audioBtn.frame = CGRectMake(16, 378, w - 32, 30);
+    audioBtn.frame = CGRectMake(16, 416, w - 32, 30);
     audioBtn.backgroundColor = [UIColor colorWithWhite:0 alpha:0.06];
     audioBtn.layer.cornerRadius = 8;
     [audioBtn setTitle:@"查看音频路径诊断" forState:UIControlStateNormal];
@@ -2142,6 +2201,13 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
 - (void)audioChanged:(UISwitch *)s
 {
     [[VCamAudio shared] setEnabled:s.on];
+}
+
+- (void)auHookChanged:(UISwitch *)s
+{
+    [[NSUserDefaults standardUserDefaults] setBool:s.on forKey:@"vcam_au_hook"];
+    [[NSUserDefaults standardUserDefaults] synchronize];
+    VCamLogLine([NSString stringWithFormat:@"用户切换底层实验开关 -> %@（重启后生效）", s.on ? @"开" : @"关"]);
 }
 
 - (void)micMuteChanged:(UISwitch *)s
@@ -2490,21 +2556,42 @@ static void VCamInstallAudioUnitHook(void)
         return;
     }
 
+    // 危险开关：只有用户主动打开才启用，避免每次启动都冒崩溃风险
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"]) {
+        VCamTrace(@"底层实验开关未打开，跳过 AudioUnit 拦截");
+        return;
+    }
+
+    VCamTrace(@"A1 准备重绑定 AudioUnitRender");
     void *orig = NULL;
     int n = VCamRebindSymbol("AudioUnitRender", (void *)VCamAudioUnitRender, &orig);
     gOrigAudioUnitRender = (OSStatus (*)(AudioUnit, UInt32, const AudioTimeStamp *,
                                          UInt32, UInt32, AudioBufferList *))orig;
-    VCamTrace(@"AudioUnitRender 重绑定 %d 处", n);
+    VCamTrace(@"A2 AudioUnitRender 重绑定 %d 处（原实现 %p）", n, orig);
 
     void *origInit = NULL;
     int n2 = VCamRebindSymbol("AudioUnitInitialize", (void *)VCamAudioUnitInitialize, &origInit);
     gOrigAudioUnitInitialize = (OSStatus (*)(AudioUnit))origInit;
-    VCamTrace(@"AudioUnitInitialize 重绑定 %d 处", n2);
+    VCamTrace(@"A3 AudioUnitInitialize 重绑定 %d 处", n2);
 
     void *origUninit = NULL;
     int n3 = VCamRebindSymbol("AudioUnitUninitialize", (void *)VCamAudioUnitUninitialize, &origUninit);
     gOrigAudioUnitUninitialize = (OSStatus (*)(AudioUnit))origUninit;
-    VCamTrace(@"AudioUnitUninitialize 重绑定 %d 处", n3);
+    VCamTrace(@"A4 AudioUnitUninitialize 重绑定 %d 处", n3);
+    VCamTrace(@"A5 底层拦截安装完成");
+}
+
+// 运行期统计 + 最近日志（用来定位崩溃点）
+static NSString *VCamRuntimeLogReport(void)
+{
+    NSMutableString *out = [NSMutableString string];
+    [out appendString:@"\n== 十、底层拦截状态与最近日志 ==\n"];
+    [out appendFormat:@"AudioUnit 拦截开关: %@\n",
+     [[NSUserDefaults standardUserDefaults] boolForKey:@"vcam_au_hook"] ? @"开" : @"关"];
+    [out appendFormat:@"渲染回调次数: %d，其中替换填充: %d\n", gRenderCalls, gRenderFills];
+    [out appendString:@"\n--- 最近 40 行日志 ---\n"];
+    [out appendString:VCamLogTail(40)];
+    return out;
 }
 
 // ======================= Hook =======================
