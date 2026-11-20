@@ -15,6 +15,7 @@
 #import <CoreImage/CoreImage.h>
 #import <UIKit/UIKit.h>
 #import <objc/runtime.h>
+#import <objc/message.h>
 #import <sys/socket.h>
 #import <netinet/in.h>
 #import <netinet/tcp.h>
@@ -735,6 +736,41 @@ static NSString *VCamAudioReport(void)
 // 抖音直播的音频采集对象（LiveStreamAudioCapture），在 startAudioCapture 时记下来
 static void *gLiveAudioCapture = NULL;
 
+// 找到音频设备模块（BAudioKitObjcAudioDeviceModule）——它管物理麦克风，静音它不会影响推送流
+static id VCamFindAudioDeviceModule(id stream)
+{
+    SEL volSel = NSSelectorFromString(@"setCaptureVolume:");
+    if (!volSel) return nil;
+
+    if (stream) {
+        NSArray *keys = @[ @"audioDeviceModule", @"adm", @"audioDevice", @"deviceModule", @"audioModule" ];
+        for (NSString *key in keys) {
+            @try {
+                id v = [stream valueForKey:key];
+                if (v && [v respondsToSelector:volSel]) return v;
+            } @catch (NSException *e) {
+                // 该属性不存在，试下一个
+            }
+        }
+    }
+
+    Class admClass = objc_getClass("BAudioKitObjcAudioDeviceModule");
+    if (admClass) {
+        NSArray *singletons = @[ @"sharedInstance", @"defaultModule", @"sharedModule", @"instance", @"shared" ];
+        for (NSString *name in singletons) {
+            SEL sel = NSSelectorFromString(name);
+            if (![admClass respondsToSelector:sel]) continue;
+            @try {
+                id v = ((id (*)(id, SEL))objc_msgSend)((id)admClass, sel);
+                if (v && [v respondsToSelector:volSel]) return v;
+            } @catch (NSException *e) {
+                // 忽略
+            }
+        }
+    }
+    return nil;
+}
+
 // 麦克风采集器（IESLiveAudioCapturerImp）实例，用它自己的静音接口只掐麦克风
 static void *gAudioCapturer = NULL;
 
@@ -815,6 +851,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 - (BOOL)micMuteEnabled;
 - (void)setMicMuteEnabled:(BOOL)enabled;
 - (void)applyMicMute;
+@property (atomic, copy) NSString *muteMode;
 - (void)enablePushStreamIfNeeded;
 - (NSUInteger)pushedChunks;
 @end
@@ -825,6 +862,7 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
     unsigned long long _samples;
     NSUInteger _chunks;
     BOOL _pushStreamEnabled;
+    NSString *_muteMode;
 }
 
 + (instancetype)shared
@@ -878,13 +916,22 @@ static BOOL VCamCallNumber(id target, NSString *selectorName, double value)
 {
     BOOL shouldMute = [self isEnabled] && [self micMuteEnabled];
 
-    // 首选：采集器自己的静音——只掐麦克风，不动我们推送的音频
+    // 第 0 级（最精准）：设备级音量——只作用在物理麦克风上，不影响我们推送的音频
+    id adm = VCamFindAudioDeviceModule((__bridge id)gLiveAudioCapture);
+    if (adm && VCamCallNumber(adm, @"setCaptureVolume:", shouldMute ? 0.0 : 1.0)) {
+        self.muteMode = @"设备音量";
+        NSLog(@"[vcam] 麦克风%@（设备级 setCaptureVolume）", shouldMute ? @"静音" : @"恢复");
+        return;
+    }
+
+    // 第 1 级：采集器自己的静音
     id capturer = (__bridge id)gAudioCapturer;
     if (capturer) {
         BOOL okCap = VCamCallNumberString(capturer, @"setAudioMute:reason:",
                                           shouldMute ? 1.0 : 0.0, @"vcam");
         if (okCap) {
-            NSLog(@"[vcam] 麦克风静音 %@（采集器 setAudioMute，精确静音）", shouldMute ? @"开" : @"关");
+            self.muteMode = @"采集器静音";
+            NSLog(@"[vcam] 麦克风%@（采集器 setAudioMute）", shouldMute ? @"静音" : @"恢复");
             return;
         }
     }
@@ -1520,12 +1567,17 @@ static UIColor *VCamMuted(void)  { return [UIColor colorWithRed:0.64 green:0.58 
         _statusText.text = why.length ? [NSString stringWithFormat:@"未连接 · %@", why] : @"未连接";
     }
     VCamAudio *audio = [VCamAudio shared];
-    _footer.text = [NSString stringWithFormat:@"%lu 帧 · 延迟 %.1fs · 音频 %@",
+    NSString *audioDesc = audio.isEnabled
+        ? [NSString stringWithFormat:@"%lu 块", (unsigned long)audio.pushedChunks]
+        : @"关";
+    NSString *muteDesc = @"";
+    if (audio.isEnabled && audio.micMuteEnabled) {
+        muteDesc = [NSString stringWithFormat:@" · 静音:%@", audio.muteMode ?: @"未知"];
+    }
+    _footer.text = [NSString stringWithFormat:@"%lu 帧 · 延迟 %.1fs · 音频 %@%@",
                     (unsigned long)c.frameCount,
                     c.latestAt ? ([NSDate timeIntervalSinceReferenceDate] - c.latestAt) : 0.0,
-                    audio.isEnabled
-                        ? [NSString stringWithFormat:@"%lu 块", (unsigned long)audio.pushedChunks]
-                        : @"关"];
+                    audioDesc, muteDesc];
 }
 
 @end
